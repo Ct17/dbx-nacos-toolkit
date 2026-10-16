@@ -4,7 +4,7 @@
   "id": "io.github.ct17.nacos_toolkit",
   "name": "Nacos Toolkit",
   "version": "0.1.1",
-  "publisher": "personal",
+  "publisher": "ct17",
   "description": "Connect to Nacos from DBX and expose read-only MCP tools to AI agents: get a config, search configs, list namespaces and services.",
   "icon": "assets/plugin.svg",
   "engines": {
