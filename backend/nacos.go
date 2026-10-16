@@ -317,10 +317,11 @@ type configItem struct {
 	Md5     string `json:"md5"`
 }
 
-// getConfig returns the full content of one config.
-func (c *nacosClient) getConfig(ctx context.Context, namespace, dataID, group string) (string, error) {
+// readConfig 读取单条配置。exists 为 false 表示该配置不存在（404），
+// 与网络或权限错误区分开——跨环境对比需要把"缺少配置"当作一种正常状态处理。
+func (c *nacosClient) readConfig(ctx context.Context, namespace, dataID, group string) (content string, exists bool, err error) {
 	if strings.TrimSpace(dataID) == "" {
-		return "", &apiError{Message: "dataId is required"}
+		return "", false, &apiError{Message: "dataId is required"}
 	}
 	if group == "" {
 		group = defaultGroup
@@ -333,18 +334,30 @@ func (c *nacosClient) getConfig(ctx context.Context, namespace, dataID, group st
 	}
 	body, status, err := c.get(ctx, "/v1/cs/configs", params)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	switch status {
 	case http.StatusOK:
-		return string(body), nil
+		return string(body), true, nil
 	case http.StatusNotFound:
-		return "", &apiError{Status: status,
-			Message: fmt.Sprintf("config not found: dataId=%s group=%s namespace=%q", dataID, group, namespace)}
+		return "", false, nil
 	default:
-		return "", &apiError{Status: status,
+		return "", false, &apiError{Status: status,
 			Message: fmt.Sprintf("reading config failed with HTTP %d", status)}
 	}
+}
+
+// getConfig returns the full content of one config.
+func (c *nacosClient) getConfig(ctx context.Context, namespace, dataID, group string) (string, error) {
+	content, exists, err := c.readConfig(ctx, namespace, dataID, group)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", &apiError{Status: http.StatusNotFound,
+			Message: fmt.Sprintf("config not found: dataId=%s group=%s namespace=%q", dataID, group, namespace)}
+	}
+	return content, nil
 }
 
 // searchConfigs lists config metadata. Empty patterns match everything; the
@@ -479,6 +492,57 @@ func (c *nacosClient) listServices(ctx context.Context, namespace, groupName str
 		return nil, &apiError{Message: fmt.Sprintf("unexpected service response: %v", err)}
 	}
 	return &page, nil
+}
+
+// instanceHost 是服务实例的关键字段（对齐 Nacos /v1/ns/instance/list 响应）。
+type instanceHost struct {
+	IP          string         `json:"ip"`
+	Port        int            `json:"port"`
+	Healthy     bool           `json:"healthy"`
+	Enabled     bool           `json:"enabled"`
+	Valid       bool           `json:"valid"`
+	Weight      float64        `json:"weight"`
+	ClusterName string         `json:"clusterName"`
+	Metadata    map[string]any `json:"metadata"`
+}
+
+// instanceList 是实例列表接口的响应。
+type instanceList struct {
+	// Name 形如 "DEFAULT_GROUP@@service-name"。
+	Name      string         `json:"name"`
+	Hosts     []instanceHost `json:"hosts"`
+	Reachable bool           `json:"reachable"`
+}
+
+// listInstances 查询某个服务在指定命名空间下的实例列表。
+func (c *nacosClient) listInstances(ctx context.Context, namespace, groupName, serviceName string) (*instanceList, error) {
+	if strings.TrimSpace(serviceName) == "" {
+		return nil, &apiError{Message: "serviceName is required"}
+	}
+	params := url.Values{}
+	params.Set("serviceName", serviceName)
+	if namespace != "" {
+		params.Set("namespaceId", namespace)
+	}
+	if groupName != "" {
+		params.Set("groupName", groupName)
+	}
+	body, status, err := c.get(ctx, "/v1/ns/instance/list", params)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, &apiError{Status: status,
+			Message: fmt.Sprintf("listing instances failed with HTTP %d", status)}
+	}
+	var payload instanceList
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, &apiError{Message: fmt.Sprintf("unexpected instance response: %v", err)}
+	}
+	if payload.Hosts == nil {
+		payload.Hosts = []instanceHost{}
+	}
+	return &payload, nil
 }
 
 // --- health -----------------------------------------------------------------

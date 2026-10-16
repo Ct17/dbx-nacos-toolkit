@@ -21,8 +21,10 @@ DBX 桌面端内置了 Nacos 配置浏览界面，但内置连接的 MCP 面是�
 | ----------------- | -------------------------------------------------- |
 | `get_config`      | 按 dataId（+ group / namespace）读取配置全文                |
 | `search_configs`  | 按关键词搜索配置，返回分页元数据（dataId / group / type / md5，不含正文） |
+| `diff_config`     | **跨环境对比**：同一配置在 2–8 个命名空间间逐行 diff（首个为基准），输出带上下文压缩的差异 |
 | `list_namespaces` | 列出所有命名空间及其配置数量                                     |
 | `list_services`   | 列出命名空间中的注册服务名                                      |
+| `list_instances`  | 列出某个服务的实例（IP / 端口 / 健康 / 权重 / 集群 / metadata）        |
 
 在 AI 客户端中工具呈现为 `dbx_nacos_toolkit__get_config` 等形式（`dbx_<插件前缀>__<工具名>`，前缀取插件 id 最后一段）；内置 AI 面板中为 `<前缀>__<工具名>`。
 
@@ -44,8 +46,8 @@ Nacos Server
 ```
 
 - 协议实现：[`dbx-plugin-sdk`](https://github.com/t8y2/dbx/tree/main/plugins/sdk/go)（Sidecar Protocol v1，JSON-RPC 2.0 / JSONL over stdio）
-- Nacos 调用：`/v1/auth/login` 鉴权（token 自动续期）＋ `/v1/cs/configs`、`/v1/console/namespaces`、`/v1/ns/service/list`
-- 无第三方依赖：Go 标准库 + DBX SDK
+- Nacos 调用：`/v1/auth/login` 鉴权（token 自动续期）＋ `/v1/cs/configs`、`/v1/console/namespaces`、`/v1/ns/service/list`、`/v1/ns/instance/list`
+- 无第三方依赖：Go 标准库 + DBX SDK（diff 为自研 LCS 实现）
 
 ## 目录结构
 
@@ -56,7 +58,9 @@ Nacos Server
 │   ├── main.go              # handler：连接生命周期 + 协议分发
 │   ├── nacos.go             # Nacos Open API 客户端
 │   ├── mcp.go               # MCP 工具定义与调用
-│   └── main_test.go         # 22 个测试（httptest 模拟 Nacos）
+│   ├── diff.go              # 行级 diff（LCS，零依赖）
+│   ├── main_test.go         # 集成测试（httptest 模拟 Nacos）
+│   └── diff_test.go         # diff 算法单元测试
 ├── scripts/smoke.py         # 协议级冒烟：模拟宿主驱动 sidecar 全链路
 ├── ui/index.html            # 工作台界面（沙箱静态页）
 ├── third_party/dbx-plugin-sdk/  # Go SDK 本地副本（go.mod replace）
@@ -119,9 +123,10 @@ npx @dbx-app/plugin-cli package .
 
 ## Roadmap
 
-- [ ] `diff_config`：跨命名空间/环境对比同一配置（对齐 issue #11893 的核心诉求）
+- [x] `diff_config`：跨命名空间/环境对比同一配置（对齐 issue #11893 的核心诉求）— v0.1.1
+- [x] `list_instances`：服务实例列表 — v0.1.1
 - [ ] `get_config_history`：配置历史版本
-- [ ] 服务实例列表（`list_instances`）
+- [ ] 工作台升级为配置浏览器（列表 / 搜索 / 查看）
 - [ ] 写工具（发布配置、dryRun 预览 + 两阶段确认，需宿主人工确认）
 
 ## 参考资料

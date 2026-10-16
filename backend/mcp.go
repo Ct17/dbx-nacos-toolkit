@@ -100,6 +100,35 @@ func mcpTools() map[string]any {
 				"annotations": map[string]any{"readOnlyHint": true},
 			},
 			{
+				"name": "diff_config",
+				"description": "Compare the same config across two to eight Nacos namespaces and return a line-level diff " +
+					"against the first namespace (the baseline). Use this to answer questions like whether dev and test " +
+					"share the same settings, or what changed between environments.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"connectionId": connectionID,
+						"dataId": map[string]any{
+							"type":        "string",
+							"description": "Config dataId to compare, e.g. gateway.yaml",
+						},
+						"group": map[string]any{
+							"type":        "string",
+							"description": "Config group; defaults to DEFAULT_GROUP.",
+						},
+						"namespaces": map[string]any{
+							"type":        "array",
+							"description": "Two to eight namespace ids; the first one is the baseline the others are compared against.",
+							"items":       map[string]any{"type": "string"},
+							"minItems":    2,
+							"maxItems":    8,
+						},
+					},
+					"required": []string{"connectionId", "dataId", "namespaces"},
+				},
+				"annotations": map[string]any{"readOnlyHint": true},
+			},
+			{
 				"name": "list_namespaces",
 				"description": "List all namespaces on the Nacos server with their config counts. " +
 					"Use this to find a namespace id before querying configs or services in that environment.",
@@ -137,6 +166,32 @@ func mcpTools() map[string]any {
 						},
 					},
 					"required": []string{"connectionId"},
+				},
+				"annotations": map[string]any{"readOnlyHint": true},
+			},
+			{
+				"name": "list_instances",
+				"description": "List the instances of one registered service in the connection namespace, including " +
+					"health state, enabled flag, weight and cluster. Use this after list_services to inspect which " +
+					"nodes currently serve a service.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"connectionId": connectionID,
+						"serviceName": map[string]any{
+							"type":        "string",
+							"description": "Registered service name, e.g. order-service.",
+						},
+						"groupName": map[string]any{
+							"type":        "string",
+							"description": "Optional service group; defaults to DEFAULT_GROUP.",
+						},
+						"namespace": map[string]any{
+							"type":        "string",
+							"description": "Optional namespace id override; defaults to the connection namespace.",
+						},
+					},
+					"required": []string{"connectionId", "serviceName"},
 				},
 				"annotations": map[string]any{"readOnlyHint": true},
 			},
@@ -206,6 +261,78 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 			"items":          page.PageItems,
 		}, false)
 
+	case "diff_config":
+		dataID := stringArg(arguments, "dataId")
+		if dataID == "" {
+			return toolError("dataId is required")
+		}
+		group := stringArg(arguments, "group")
+		if group == "" {
+			group = defaultGroup
+		}
+		namespaces := stringArray(arguments, "namespaces")
+		if len(namespaces) < 2 {
+			return toolError("namespaces requires at least two entries; the first one is the baseline")
+		}
+		if len(namespaces) > 8 {
+			return toolError("at most 8 namespaces per diff call")
+		}
+
+		// 先逐个读取所有命名空间的配置内容，再统一生成对比结果；
+		// 任一命名空间读取失败（网络/权限）直接作为工具错误返回。
+		type reading struct {
+			namespace string
+			content   string
+			exists    bool
+		}
+		readings := make([]reading, 0, len(namespaces))
+		for _, namespace := range namespaces {
+			content, exists, err := session.client.readConfig(ctx, namespace, dataID, group)
+			if err != nil {
+				return toolError(fmt.Sprintf("reading namespace %q failed: %v", namespace, err))
+			}
+			readings = append(readings, reading{namespace: namespace, content: content, exists: exists})
+		}
+
+		baseline := readings[0]
+		comparisons := make([]map[string]any, 0, len(readings)-1)
+		for _, target := range readings[1:] {
+			entry := map[string]any{"namespace": target.namespace}
+			switch {
+			case !baseline.exists && !target.exists:
+				entry["status"] = "missing-in-both"
+			case !baseline.exists:
+				entry["status"] = "missing-in-baseline"
+			case !target.exists:
+				entry["status"] = "missing-in-target"
+			default:
+				diffs, err := lineDiffs(baseline.content, target.content)
+				if err != nil {
+					return toolError(err.Error())
+				}
+				added, removed := countChanges(diffs)
+				if added == 0 && removed == 0 {
+					entry["status"] = "identical"
+				} else {
+					entry["status"] = "different"
+					entry["added"] = added
+					entry["removed"] = removed
+					entry["diff"] = renderDiff(diffs, diffContext)
+				}
+			}
+			comparisons = append(comparisons, entry)
+		}
+		return toolJSON(map[string]any{
+			"connection": session.name,
+			"dataId":     dataID,
+			"group":      group,
+			"baseline": map[string]any{
+				"namespace": baseline.namespace,
+				"exists":    baseline.exists,
+			},
+			"comparisons": comparisons,
+		}, false)
+
 	case "list_namespaces":
 		namespaces, err := session.client.listNamespaces(ctx)
 		if err != nil {
@@ -240,6 +367,53 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 			"namespace":  namespace,
 			"count":      page.Count,
 			"services":   services,
+		}, false)
+
+	case "list_instances":
+		serviceName := stringArg(arguments, "serviceName")
+		if serviceName == "" {
+			return toolError("serviceName is required")
+		}
+		namespace := stringArg(arguments, "namespace")
+		if namespace == "" {
+			namespace = session.namespace
+		}
+		groupName := stringArg(arguments, "groupName")
+		if groupName == "" {
+			groupName = defaultGroup
+		}
+		page, err := session.client.listInstances(ctx, namespace, groupName, serviceName)
+		if err != nil {
+			return toolError(err.Error())
+		}
+		instances := make([]map[string]any, 0, len(page.Hosts))
+		healthyCount := 0
+		for _, host := range page.Hosts {
+			if host.Healthy {
+				healthyCount++
+			}
+			entry := map[string]any{
+				"ip":      host.IP,
+				"port":    host.Port,
+				"healthy": host.Healthy,
+				"enabled": host.Enabled,
+				"valid":   host.Valid,
+				"weight":  host.Weight,
+				"cluster": host.ClusterName,
+			}
+			if len(host.Metadata) > 0 {
+				entry["metadata"] = host.Metadata
+			}
+			instances = append(instances, entry)
+		}
+		return toolJSON(map[string]any{
+			"connection":    session.name,
+			"namespace":     namespace,
+			"serviceName":   serviceName,
+			"groupName":     groupName,
+			"instanceCount": len(page.Hosts),
+			"healthyCount":  healthyCount,
+			"instances":     instances,
 		}, false)
 
 	case "":
@@ -393,6 +567,21 @@ func stringArg(values map[string]any, key string) string {
 		return strings.TrimSpace(value)
 	}
 	return ""
+}
+
+// stringArray 从参数中提取字符串数组（逐项去除首尾空白并过滤空串）。
+func stringArray(values map[string]any, key string) []string {
+	raw, ok := values[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if value, ok := item.(string); ok && strings.TrimSpace(value) != "" {
+			out = append(out, strings.TrimSpace(value))
+		}
+	}
+	return out
 }
 
 func intArg(values map[string]any, key string) int {

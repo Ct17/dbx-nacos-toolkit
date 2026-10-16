@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.github.ct17.nacos_toolkit",
   "name": "Nacos Toolkit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "personal",
   "description": "Connect to Nacos from DBX and expose read-only MCP tools to AI agents: get a config, search configs, list namespaces and services.",
   "icon": "assets/plugin.svg",
@@ -97,7 +97,7 @@
     {
       "type": "mcp",
       "id": "io.github.ct17.nacos_toolkit.mcp",
-      "description": "Read-only Nacos tools: get config, search configs, list namespaces, list services.",
+      "description": "Read-only Nacos tools: get/search/diff configs, list namespaces, list services and instances.",
       "ai_tools": true,
       "external_tools": true
     }

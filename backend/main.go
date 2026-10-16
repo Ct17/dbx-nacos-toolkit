@@ -13,7 +13,7 @@ import (
 
 const (
 	pluginID      = "io.github.ct17.nacos_toolkit"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.1.1"
 )
 
 // connectionRecord is the normalized connection payload captured at

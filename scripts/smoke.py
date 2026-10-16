@@ -90,7 +90,12 @@ class MockNacos(http.server.BaseHTTPRequestHandler):
                 })
                 return
             if query.get("dataId", [""])[0] == "gateway.yaml":
-                self._text("server:\n  port: 9000\n")
+                # prod 命名空间返回不同内容，供 diff_config 冒烟断言使用。
+                tenant = query.get("tenant", [""])[0]
+                if tenant == "prod":
+                    self._text("server:\n  port: 8080\n")
+                else:
+                    self._text("server:\n  port: 9000\n")
                 return
             self._json({"status": 404, "message": "config data not exist"}, 404)
             return
@@ -104,6 +109,17 @@ class MockNacos(http.server.BaseHTTPRequestHandler):
 
         if path == "/nacos/v1/ns/service/list":
             self._json({"count": 1, "doms": ["order-service"]})
+            return
+
+        if path == "/nacos/v1/ns/instance/list":
+            self._json({
+                "name": "DEFAULT_GROUP@@order-service",
+                "reachable": True,
+                "hosts": [
+                    {"ip": "10.0.0.1", "port": 8080, "healthy": True, "enabled": True,
+                     "valid": True, "weight": 1, "clusterName": "DEFAULT", "metadata": {}},
+                ],
+            })
             return
 
         self._text("not found", 404)
@@ -214,8 +230,8 @@ def main():
             tools = sidecar.request(4, "mcp/tools", {"connectionId": "smoke-conn"})
             catalogue = tools.get("result", {}).get("tools", [])
             names = sorted(tool["name"] for tool in catalogue)
-            check("mcp/tools lists the 4 read-only tools",
-                  names == ["get_config", "list_namespaces", "list_services", "search_configs"],
+            check("mcp/tools lists the 6 read-only tools",
+                  names == ["diff_config", "get_config", "list_instances", "list_namespaces", "list_services", "search_configs"],
                   json.dumps(names))
             check("every tool is marked readOnlyHint",
                   all(tool.get("annotations", {}).get("readOnlyHint") is True
@@ -249,7 +265,25 @@ def main():
             check("missing config becomes an isError result",
                   missing.get("result", {}).get("isError") is True)
 
-            unknown = sidecar.request(8, "does/not-exist", {})
+            diff_call = sidecar.request(8, "mcp/call", {
+                "tool": "diff_config",
+                "arguments": {"dataId": "gateway.yaml", "namespaces": ["dev", "prod"]},
+                "lifecycle": {"connection": connection},
+            })
+            text = diff_call.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("mcp/call diff_config reports the namespace difference",
+                  '"status": "different"' in text and "+   port: 8080" in text, text)
+
+            instances = sidecar.request(9, "mcp/call", {
+                "tool": "list_instances",
+                "arguments": {"serviceName": "order-service"},
+                "lifecycle": {"connection": connection},
+            })
+            text = instances.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("mcp/call list_instances returns the instance list",
+                  "10.0.0.1" in text and '"instanceCount": 1' in text, text)
+
+            unknown = sidecar.request(10, "does/not-exist", {})
             check("unknown methods return JSON-RPC error -32601",
                   unknown.get("error", {}).get("code") == -32601,
                   json.dumps(unknown))

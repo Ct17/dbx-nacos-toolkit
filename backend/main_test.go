@@ -61,10 +61,14 @@ func newMockNacos(t *testing.T) *httptest.Server {
 			]}`))
 			return
 		}
-		switch query.Get("dataId") {
-		case "gateway.yaml":
+		switch {
+		case query.Get("dataId") == "gateway.yaml" && query.Get("tenant") == "prod":
+			// prod 命名空间下同名配置内容不同，供 diff_config 测试使用。
+			_, _ = w.Write([]byte("server:\n  port: 8080\nroutes:\n  - id: order\n  - id: user\n"))
+		case query.Get("dataId") == "gateway.yaml" && query.Get("tenant") != "empty-ns":
+			// dev / dev2 / 空 tenant 返回同一份内容；empty-ns 走 404 分支。
 			_, _ = w.Write([]byte("server:\n  port: 9000\nroutes:\n  - id: order\n"))
-		case "hidden.yaml":
+		case query.Get("dataId") == "hidden.yaml":
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte("authorization failed"))
 		default:
@@ -92,6 +96,21 @@ func newMockNacos(t *testing.T) *httptest.Server {
 			return
 		}
 		_, _ = w.Write([]byte(`{"count":2,"doms":["order-service","gateway-service"]}`))
+	})
+
+	mux.HandleFunc("/nacos/v1/ns/instance/list", func(w http.ResponseWriter, r *http.Request) {
+		if !authOK(w, r) {
+			return
+		}
+		if r.URL.Query().Get("serviceName") != "order-service" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"status":404,"message":"service not found"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"name":"DEFAULT_GROUP@@order-service","reachable":true,"hosts":[
+			{"ip":"10.0.0.1","port":8080,"healthy":true,"enabled":true,"valid":true,"weight":1,"clusterName":"DEFAULT","metadata":{"zone":"az1"}},
+			{"ip":"10.0.0.2","port":8080,"healthy":false,"enabled":true,"valid":true,"weight":0.5,"clusterName":"DEFAULT","metadata":{}}
+		]}`))
 	})
 
 	server := httptest.NewServer(mux)
@@ -200,8 +219,8 @@ func TestToolCatalogue(t *testing.T) {
 		t.Fatalf("mcp/tools failed: %+v", pluginErr)
 	}
 	tools, ok := result["tools"].([]any)
-	if !ok || len(tools) != 4 {
-		t.Fatalf("expected 4 tools, got %v", result["tools"])
+	if !ok || len(tools) != 6 {
+		t.Fatalf("expected 6 tools, got %v", result["tools"])
 	}
 	names := map[string]bool{}
 	for _, entry := range tools {
@@ -217,7 +236,7 @@ func TestToolCatalogue(t *testing.T) {
 			t.Errorf("tool %v schema must declare connectionId", tool["name"])
 		}
 	}
-	for _, want := range []string{"get_config", "search_configs", "list_namespaces", "list_services"} {
+	for _, want := range []string{"get_config", "search_configs", "diff_config", "list_namespaces", "list_services", "list_instances"} {
 		if !names[want] {
 			t.Errorf("missing tool %s", want)
 		}
@@ -324,6 +343,121 @@ func TestListServicesTool(t *testing.T) {
 	text := toolText(t, result)
 	if !strings.Contains(text, "order-service") || !strings.Contains(text, "gateway-service") {
 		t.Fatalf("service names missing: %s", text)
+	}
+}
+
+func TestDiffConfigTool(t *testing.T) {
+	// dev 与 prod 存在内容差异，empty-ns 下配置缺失。
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "diff_config", map[string]any{
+		"dataId":     "gateway.yaml",
+		"namespaces": []any{"dev", "prod", "empty-ns"},
+	}, connectionPayload(t, server))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "\"status\": \"different\"") {
+		t.Fatalf("dev vs prod 应为 different: %s", text)
+	}
+	if !strings.Contains(text, "+   port: 8080") || !strings.Contains(text, "-   port: 9000") {
+		t.Fatalf("diff 内容不符合预期: %s", text)
+	}
+	if !strings.Contains(text, "+   - id: user") {
+		t.Fatalf("prod 多出的 routes 行未体现: %s", text)
+	}
+	if !strings.Contains(text, "\"status\": \"missing-in-target\"") {
+		t.Fatalf("empty-ns 应为 missing-in-target: %s", text)
+	}
+}
+
+func TestDiffConfigSameContent(t *testing.T) {
+	// dev 与 dev2 在 mock 中返回相同内容（都走默认分支）。
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "diff_config", map[string]any{
+		"dataId":     "gateway.yaml",
+		"namespaces": []any{"dev", "dev2"},
+	}, connectionPayload(t, server))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	if !strings.Contains(toolText(t, result), "\"status\": \"identical\"") {
+		t.Fatalf("相同内容应为 identical: %s", toolText(t, result))
+	}
+}
+
+func TestDiffConfigRequiresTwoNamespaces(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "diff_config", map[string]any{
+		"dataId":     "gateway.yaml",
+		"namespaces": []any{"dev"},
+	}, connectionPayload(t, server))
+	if !toolIsError(result) {
+		t.Fatalf("单个命名空间应报错: %v", result)
+	}
+	if !strings.Contains(toolText(t, result), "at least two") {
+		t.Fatalf("错误提示不符合预期: %s", toolText(t, result))
+	}
+}
+
+func TestDiffConfigMissingDataId(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "diff_config", map[string]any{
+		"namespaces": []any{"dev", "prod"},
+	}, connectionPayload(t, server))
+	if !toolIsError(result) || !strings.Contains(toolText(t, result), "dataId is required") {
+		t.Fatalf("缺少 dataId 应报错: %v", result)
+	}
+}
+
+func TestListInstancesTool(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "list_instances", map[string]any{
+		"serviceName": "order-service",
+	}, connectionPayload(t, server))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "\"instanceCount\": 2") || !strings.Contains(text, "\"healthyCount\": 1") {
+		t.Fatalf("实例统计不符合预期: %s", text)
+	}
+	if !strings.Contains(text, "10.0.0.1") || !strings.Contains(text, "10.0.0.2") {
+		t.Fatalf("实例地址缺失: %s", text)
+	}
+	if !strings.Contains(text, "\"healthy\": false") {
+		t.Fatalf("不健康实例未标注: %s", text)
+	}
+	if !strings.Contains(text, "\"zone\": \"az1\"") {
+		t.Fatalf("实例 metadata 缺失: %s", text)
+	}
+}
+
+func TestListInstancesNotFound(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "list_instances", map[string]any{
+		"serviceName": "no-such-service",
+	}, connectionPayload(t, server))
+	if !toolIsError(result) {
+		t.Fatalf("不存在的服务应返回错误结果: %v", result)
+	}
+	if !strings.Contains(toolText(t, result), "404") {
+		t.Fatalf("错误信息不符合预期: %s", toolText(t, result))
+	}
+}
+
+func TestListInstancesRequiresServiceName(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "list_instances", map[string]any{}, connectionPayload(t, server))
+	if !toolIsError(result) || !strings.Contains(toolText(t, result), "serviceName is required") {
+		t.Fatalf("缺少 serviceName 应报错: %v", result)
 	}
 }
 
