@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nacos Toolkit</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        --accent: #2f6bff;
+        --card-border: color-mix(in srgb, CanvasText 14%, transparent);
+        --muted: color-mix(in srgb, CanvasText 62%, transparent);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        padding: 32px;
+        background: radial-gradient(circle at top left, rgba(47, 107, 255, 0.14), transparent 42%), Canvas;
+        color: CanvasText;
+      }
+      main { width: min(720px, 100%); margin: 0 auto; display: grid; gap: 20px; }
+      header .eyebrow { color: var(--accent); font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+      h1 { margin: 8px 0 6px; font-size: 28px; }
+      header p { margin: 0; line-height: 1.6; color: var(--muted); }
+      section {
+        padding: 18px 20px;
+        border: 1px solid var(--card-border);
+        border-radius: 14px;
+        background: color-mix(in srgb, Canvas 94%, transparent);
+      }
+      section h2 { margin: 0 0 12px; font-size: 15px; letter-spacing: .02em; }
+      .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+      .card-head h2 { margin: 0; }
+      button {
+        border: 0;
+        border-radius: 10px;
+        padding: 8px 14px;
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled { opacity: .55; cursor: wait; }
+      pre {
+        margin: 0;
+        min-height: 64px;
+        overflow: auto;
+        padding: 12px 14px;
+        border-radius: 10px;
+        background: color-mix(in srgb, CanvasText 6%, transparent);
+        font-size: 13px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+      }
+      ul.tools { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+      ul.tools li { padding: 10px 12px; border-radius: 10px; background: color-mix(in srgb, CanvasText 5%, transparent); }
+      ul.tools .name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; font-weight: 600; color: var(--accent); }
+      ul.tools .desc { margin-top: 4px; font-size: 13px; line-height: 1.5; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="eyebrow" id="eyebrow">DBX plugin</div>
+        <h1 id="title">Nacos Toolkit</h1>
+        <p id="description"></p>
+      </header>
+
+      <section>
+        <div class="card-head">
+          <h2 id="statusTitle">Connection</h2>
+          <button id="check" type="button">Check</button>
+        </div>
+        <pre id="status"></pre>
+      </section>
+
+      <section>
+        <h2 id="toolsTitle">Tools exposed to AI agents</h2>
+        <ul class="tools" id="tools"><li><div class="desc" id="toolsLoading"></div></li></ul>
+      </section>
+    </main>
+    <script>
+      const copy = {
+        en: {
+          eyebrow: "DBX plugin",
+          title: "Nacos Toolkit",
+          description: "Read-only Nacos tools for AI agents. Open a saved Nacos connection to use them from Claude Code, Cursor or the DBX AI panel.",
+          statusTitle: "Connection",
+          check: "Check connection",
+          checking: "Checking…",
+          statusWait: "Click “Check connection” to probe the Nacos server of this workbench.",
+          noConnection: "Open a saved Nacos connection first, then reopen this workbench.",
+          toolsTitle: "Tools exposed to AI agents",
+          toolsLoading: "Loading tool catalogue…",
+          toolsError: "Could not load tools"
+        },
+        zh: {
+          eyebrow: "DBX 插件",
+          title: "Nacos 工具箱",
+          description: "面向 AI 助手的只读 Nacos 工具。打开一个已保存的 Nacos 连接后，即可在 Claude Code、Cursor 或 DBX AI 面板中使用。",
+          statusTitle: "连接状态",
+          check: "检查连接",
+          checking: "检查中…",
+          statusWait: "点击「检查连接」探测当前工作台的 Nacos 服务端。",
+          noConnection: "请先打开一个已保存的 Nacos 连接，再重新打开此工作台。",
+          toolsTitle: "向 AI 助手开放的工具",
+          toolsLoading: "正在加载工具列表…",
+          toolsError: "工具列表加载失败"
+        }
+      };
+      const $ = (id) => document.getElementById(id);
+      let text = copy.en;
+
+      function applyCopy() {
+        $("eyebrow").textContent = text.eyebrow;
+        $("title").textContent = text.title;
+        $("description").textContent = text.description;
+        $("statusTitle").textContent = text.statusTitle;
+        $("check").textContent = text.check;
+        $("toolsTitle").textContent = text.toolsTitle;
+        $("status").textContent = text.statusWait;
+        $("toolsLoading").textContent = text.toolsLoading;
+      }
+      applyCopy();
+
+      const connectionId = () =>
+        window.dbxPlugin.context && window.dbxPlugin.context.connectionId;
+
+      async function loadTools() {
+        const list = $("tools");
+        try {
+          const result = await window.dbxPlugin.invoke("mcp/tools", {});
+          list.textContent = "";
+          for (const tool of result.tools) {
+            const item = document.createElement("li");
+            const name = document.createElement("div");
+            name.className = "name";
+            name.textContent = tool.name;
+            const desc = document.createElement("div");
+            desc.className = "desc";
+            desc.textContent = tool.description;
+            item.append(name, desc);
+            list.append(item);
+          }
+        } catch (error) {
+          list.textContent = "";
+          const item = document.createElement("li");
+          item.textContent = text.toolsError + ": " + error.message;
+          list.append(item);
+        }
+      }
+
+      $("check").addEventListener("click", async () => {
+        const button = $("check");
+        button.disabled = true;
+        $("status").textContent = text.checking;
+        try {
+          if (!connectionId()) {
+            $("status").textContent = text.noConnection;
+          } else {
+            const result = await window.dbxPlugin.invoke("nacos/ping", { connectionId: connectionId() });
+            $("status").textContent = JSON.stringify(result, null, 2);
+          }
+        } catch (error) {
+          $("status").textContent = "✗ " + error.message;
+        } finally {
+          button.disabled = false;
+        }
+      });
+
+      window.dbxPlugin.ready.then(() => {
+        text = window.dbxPlugin.locale.toLowerCase().startsWith("zh") ? copy.zh : copy.en;
+        applyCopy();
+        $("status").textContent = text.statusWait;
+        loadTools();
+      });
+    </script>
+  </body>
+</html>
