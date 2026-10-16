@@ -9,6 +9,16 @@ permissions:
 
 jobs:
   release:
+    # SECURITY: `uses:` is pinned to a branch, so the referenced workflow runs
+    # whatever code that ref points at on release day — and it holds
+    # `contents: write` on this repository. Pin it to a commit SHA instead:
+    #
+    #   t8y2/dbx/.github/workflows/plugin-release-reusable.yml@<40-char-sha>
+    #
+    # TODO(2026-10-16): the ref `plugin-sdk-v1` cannot be resolved on the public
+    # repo (no branch, no tag of that name, no reusable workflow on main), so
+    # this job fails before starting. Restore the correct ref or, better,
+    # replace it with the SHA it should be frozen at.
     uses: t8y2/dbx/.github/workflows/plugin-release-reusable.yml@plugin-sdk-v1
     with:
       release-tag: ${{ github.event.release.tag_name }}

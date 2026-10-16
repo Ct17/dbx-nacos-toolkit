@@ -3,3 +3,12 @@
 .dbx-repository-signing-key.env
 .DS_Store
 *.log
+
+# Compiled sidecar binaries (dbx-plugin.toml builds them at package time)
+/backend/dbx-nacos-toolkit
+/backend/dbx-plugin-nacos-toolkit
+
+# Packaged plugins and editor state
+*.dbxp
+.idea/
+.vscode/
