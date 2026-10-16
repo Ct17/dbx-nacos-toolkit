@@ -8,21 +8,21 @@ DBX 桌面端内置了 Nacos 配置浏览界面，但内置连接的 MCP 面是�
 
 **连接表单**（连接树 → 新建连接 → Nacos）
 
-| 字段 | 说明 |
-| --- | --- |
-| 服务地址 / 端口 | 支持 `127.0.0.1`、域名、`https://…`；默认端口 8848 |
-| Context Path | 默认 `/nacos`，自定义部署时修改 |
-| 命名空间 ID | 留空为 public |
-| 用户名 / 密码 | Nacos 未开启鉴权时留空 |
+| 字段           | 说明                                      |
+| ------------ | --------------------------------------- |
+| 服务地址 / 端口    | 支持 `127.0.0.1`、域名、`https://…`；默认端口 8848 |
+| Context Path | 默认 `/nacos`，自定义部署时修改                    |
+| 命名空间 ID      | 留空为 public                              |
+| 用户名 / 密码     | Nacos 未开启鉴权时留空                          |
 
 **MCP 工具**（全部只读，声明 `readOnlyHint: true`，AI 调用无需人工确认）
 
-| 工具 | 说明 |
-| --- | --- |
-| `get_config` | 按 dataId（+ group / namespace）读取配置全文 |
-| `search_configs` | 按关键词搜索配置，返回分页元数据（dataId / group / type / md5，不含正文） |
-| `list_namespaces` | 列出所有命名空间及其配置数量 |
-| `list_services` | 列出命名空间中的注册服务名 |
+| 工具                | 说明                                                 |
+| ----------------- | -------------------------------------------------- |
+| `get_config`      | 按 dataId（+ group / namespace）读取配置全文                |
+| `search_configs`  | 按关键词搜索配置，返回分页元数据（dataId / group / type / md5，不含正文） |
+| `list_namespaces` | 列出所有命名空间及其配置数量                                     |
+| `list_services`   | 列出命名空间中的注册服务名                                      |
 
 在 AI 客户端中工具呈现为 `dbx_nacos_toolkit__get_config` 等形式（`dbx_<插件前缀>__<工具名>`，前缀取插件 id 最后一段）；内置 AI 面板中为 `<前缀>__<工具名>`。
 

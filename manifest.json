@@ -24,7 +24,7 @@
     {
       "type": "connection-provider",
       "id": "io.github.ct17.nacos_toolkit.connection",
-      "label": "Nacos",
+      "label": "Nacos Toolkit",
       "icon": "assets/plugin.svg",
       "database_type": "nacos-toolkit",
       "description": "Connect to a Nacos server to browse configs and expose read-only tools to the MCP server.",
@@ -108,7 +108,7 @@
       "description": "在 DBX 中连接 Nacos，并向 AI 助手开放只读 MCP 工具：读配置、搜索配置、列命名空间、列服务。",
       "contributions": {
         "io.github.ct17.nacos_toolkit.connection": {
-          "label": "Nacos 连接",
+          "label": "Nacos 工具箱",
           "description": "连接 Nacos 服务器，浏览配置并向 AI 开放只读工具。",
           "fields": {
             "display_name": { "label": "连接名称" },
