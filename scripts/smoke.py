@@ -122,6 +122,19 @@ class MockNacos(http.server.BaseHTTPRequestHandler):
             })
             return
 
+        if path == "/nacos/v1/cs/history":
+            self._json({
+                "totalCount": 1,
+                "pageNumber": 1,
+                "pagesAvailable": 1,
+                "pageItems": [
+                    {"id": "1001", "dataId": "gateway.yaml", "group": "DEFAULT_GROUP",
+                     "tenant": "dev", "md5": "aaa", "srcUser": "alice", "srcIp": "10.1.1.1",
+                     "opType": "U", "createdTime": 1760000000000},
+                ],
+            })
+            return
+
         self._text("not found", 404)
 
 
@@ -230,8 +243,9 @@ def main():
             tools = sidecar.request(4, "mcp/tools", {"connectionId": "smoke-conn"})
             catalogue = tools.get("result", {}).get("tools", [])
             names = sorted(tool["name"] for tool in catalogue)
-            check("mcp/tools lists the 6 read-only tools",
-                  names == ["diff_config", "get_config", "list_instances", "list_namespaces", "list_services", "search_configs"],
+            check("mcp/tools lists the 7 read-only tools",
+                  names == ["diff_config", "get_config", "get_config_history", "list_instances",
+                            "list_namespaces", "list_services", "search_configs"],
                   json.dumps(names))
             check("every tool is marked readOnlyHint",
                   all(tool.get("annotations", {}).get("readOnlyHint") is True
@@ -282,6 +296,15 @@ def main():
             text = instances.get("result", {}).get("content", [{}])[0].get("text", "")
             check("mcp/call list_instances returns the instance list",
                   "10.0.0.1" in text and '"instanceCount": 1' in text, text)
+
+            history = sidecar.request(11, "mcp/call", {
+                "tool": "get_config_history",
+                "arguments": {"dataId": "gateway.yaml"},
+                "lifecycle": {"connection": connection},
+            })
+            text = history.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("mcp/call get_config_history lists revisions",
+                  '"historyId": "1001"' in text and '"operator": "alice"' in text, text)
 
             unknown = sidecar.request(10, "does/not-exist", {})
             check("unknown methods return JSON-RPC error -32601",

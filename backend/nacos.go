@@ -420,6 +420,100 @@ func normalizePaging(pageNo, pageSize int) (int, int) {
 	return pageNo, pageSize
 }
 
+// configRevision 是一条配置变更历史记录（对齐 /v1/cs/history 响应字段）。
+type configRevision struct {
+	ID          string `json:"id"`
+	DataID      string `json:"dataId"`
+	Group       string `json:"group"`
+	Tenant      string `json:"tenant"`
+	AppName     string `json:"appName"`
+	Md5         string `json:"md5"`
+	SrcIP       string `json:"srcIp"`
+	SrcUser     string `json:"srcUser"`
+	OpType      string `json:"opType"` // I 新增 / U 更新 / D 删除
+	CreatedTime int64  `json:"createdTime"`
+}
+
+// configRevisionDetail 是单个历史版本的详情（含配置内容）。
+type configRevisionDetail struct {
+	configRevision
+	Content string `json:"content"`
+}
+
+// configHistoryPage 是历史列表的分页响应。
+type configHistoryPage struct {
+	TotalCount     int              `json:"totalCount"`
+	PageNumber     int              `json:"pageNumber"`
+	PagesAvailable int              `json:"pagesAvailable"`
+	PageItems      []configRevision `json:"pageItems"`
+}
+
+// listConfigHistory 按 dataId 列出历史版本，最新在前。
+func (c *nacosClient) listConfigHistory(ctx context.Context, namespace, dataID, group string, pageNo, pageSize int) (*configHistoryPage, error) {
+	if strings.TrimSpace(dataID) == "" {
+		return nil, &apiError{Message: "dataId is required"}
+	}
+	pageNo, pageSize = normalizePaging(pageNo, pageSize)
+	params := url.Values{}
+	params.Set("search", "accurate")
+	params.Set("dataId", dataID)
+	params.Set("group", group)
+	if namespace != "" {
+		params.Set("tenant", namespace)
+	}
+	params.Set("pageNo", strconv.Itoa(pageNo))
+	params.Set("pageSize", strconv.Itoa(pageSize))
+	body, status, err := c.get(ctx, "/v1/cs/history", params)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, &apiError{Status: status,
+			Message: fmt.Sprintf("listing config history failed with HTTP %d", status)}
+	}
+	var page configHistoryPage
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, &apiError{Message: fmt.Sprintf("unexpected history response: %v", err)}
+	}
+	if page.PageItems == nil {
+		page.PageItems = []configRevision{}
+	}
+	return &page, nil
+}
+
+// getConfigRevision 读取单个历史版本的完整内容（按历史记录 id）。
+func (c *nacosClient) getConfigRevision(ctx context.Context, namespace, dataID, group, historyID string) (*configRevisionDetail, error) {
+	if strings.TrimSpace(historyID) == "" {
+		return nil, &apiError{Message: "historyId is required"}
+	}
+	params := url.Values{}
+	params.Set("search", "accurate")
+	params.Set("dataId", dataID)
+	params.Set("group", group)
+	if namespace != "" {
+		params.Set("tenant", namespace)
+	}
+	params.Set("nid", historyID)
+	body, status, err := c.get(ctx, "/v1/cs/history", params)
+	if err != nil {
+		return nil, err
+	}
+	switch status {
+	case http.StatusOK:
+		var detail configRevisionDetail
+		if err := json.Unmarshal(body, &detail); err != nil {
+			return nil, &apiError{Message: fmt.Sprintf("unexpected history detail response: %v", err)}
+		}
+		return &detail, nil
+	case http.StatusNotFound:
+		return nil, &apiError{Status: status,
+			Message: fmt.Sprintf("config revision not found: dataId=%s group=%s namespace=%q historyId=%s", dataID, group, namespace, historyID)}
+	default:
+		return nil, &apiError{Status: status,
+			Message: fmt.Sprintf("reading config revision failed with HTTP %d", status)}
+	}
+}
+
 // namespace is one Nacos namespace entry.
 type namespace struct {
 	NamespaceID   string `json:"namespace"`

@@ -22,6 +22,7 @@ DBX 桌面端内置了 Nacos 配置浏览界面，但内置连接的 MCP 面是�
 | `get_config`      | 按 dataId（+ group / namespace）读取配置全文                |
 | `search_configs`  | 按关键词搜索配置，返回分页元数据（dataId / group / type / md5，不含正文） |
 | `diff_config`     | **跨环境对比**：同一配置在 2–8 个命名空间间逐行 diff（首个为基准），输出带上下文压缩的差异 |
+| `get_config_history` | **配置历史**：列出变更记录（时间 / 操作人 / opType / md5），传 `historyId` 可读该历史版本的完整内容 |
 | `list_namespaces` | 列出所有命名空间及其配置数量                                     |
 | `list_services`   | 列出命名空间中的注册服务名                                      |
 | `list_instances`  | 列出某个服务的实例（IP / 端口 / 健康 / 权重 / 集群 / metadata）        |
@@ -125,7 +126,7 @@ npx @dbx-app/plugin-cli package .
 
 - [x] `diff_config`：跨命名空间/环境对比同一配置（对齐 issue #11893 的核心诉求）— v0.1.1
 - [x] `list_instances`：服务实例列表 — v0.1.1
-- [ ] `get_config_history`：配置历史版本
+- [x] `get_config_history`：配置历史版本（列表 + 单版本内容）— v0.1.1
 - [ ] 工作台升级为配置浏览器（列表 / 搜索 / 查看）
 - [ ] 写工具（发布配置、dryRun 预览 + 两阶段确认，需宿主人工确认）
 

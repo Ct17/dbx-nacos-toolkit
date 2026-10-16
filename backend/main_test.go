@@ -113,6 +113,29 @@ func newMockNacos(t *testing.T) *httptest.Server {
 		]}`))
 	})
 
+	mux.HandleFunc("/nacos/v1/cs/history", func(w http.ResponseWriter, r *http.Request) {
+		if !authOK(w, r) {
+			return
+		}
+		query := r.URL.Query()
+		// 指定 nid 时返回单个历史版本的详情（含 content）。
+		if nid := query.Get("nid"); nid != "" {
+			if nid != "1001" {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"status":404,"message":"no config history"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"1001","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev",
+				"md5":"aaa","content":"server:\n  port: 8999\n","srcUser":"alice","srcIp":"10.1.1.1",
+				"opType":"U","createdTime":1760000000000}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+			{"id":"1001","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev","md5":"aaa","srcUser":"alice","srcIp":"10.1.1.1","opType":"U","createdTime":1760000000000},
+			{"id":"1000","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev","md5":"bbb","srcUser":"bob","srcIp":"10.1.1.2","opType":"I","createdTime":1759000000000}
+		]}`))
+	})
+
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server
@@ -219,8 +242,8 @@ func TestToolCatalogue(t *testing.T) {
 		t.Fatalf("mcp/tools failed: %+v", pluginErr)
 	}
 	tools, ok := result["tools"].([]any)
-	if !ok || len(tools) != 6 {
-		t.Fatalf("expected 6 tools, got %v", result["tools"])
+	if !ok || len(tools) != 7 {
+		t.Fatalf("expected 7 tools, got %v", result["tools"])
 	}
 	names := map[string]bool{}
 	for _, entry := range tools {
@@ -236,7 +259,7 @@ func TestToolCatalogue(t *testing.T) {
 			t.Errorf("tool %v schema must declare connectionId", tool["name"])
 		}
 	}
-	for _, want := range []string{"get_config", "search_configs", "diff_config", "list_namespaces", "list_services", "list_instances"} {
+	for _, want := range []string{"get_config", "search_configs", "diff_config", "get_config_history", "list_namespaces", "list_services", "list_instances"} {
 		if !names[want] {
 			t.Errorf("missing tool %s", want)
 		}
@@ -458,6 +481,87 @@ func TestListInstancesRequiresServiceName(t *testing.T) {
 	result := callToolRaw(t, p, "list_instances", map[string]any{}, connectionPayload(t, server))
 	if !toolIsError(result) || !strings.Contains(toolText(t, result), "serviceName is required") {
 		t.Fatalf("缺少 serviceName 应报错: %v", result)
+	}
+}
+
+func TestGetConfigHistoryList(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config_history", map[string]any{
+		"dataId": "gateway.yaml",
+	}, connectionPayload(t, server))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "\"totalCount\": 2") {
+		t.Fatalf("历史总数不符合预期: %s", text)
+	}
+	if !strings.Contains(text, "\"historyId\": \"1001\"") || !strings.Contains(text, "\"operator\": \"alice\"") {
+		t.Fatalf("最新历史记录字段缺失: %s", text)
+	}
+	if !strings.Contains(text, "\"opType\": \"U\"") || !strings.Contains(text, "\"opType\": \"I\"") {
+		t.Fatalf("操作类型未体现: %s", text)
+	}
+	// 列表模式不应携带配置正文。
+	if strings.Contains(text, "port: 8999") {
+		t.Fatalf("列表模式不应返回 content: %s", text)
+	}
+}
+
+func TestGetConfigHistoryRevision(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config_history", map[string]any{
+		"dataId":    "gateway.yaml",
+		"historyId": "1001",
+	}, connectionPayload(t, server))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "port: 8999") {
+		t.Fatalf("详情模式应返回该版本内容: %s", text)
+	}
+	if !strings.Contains(text, "\"historyId\": \"1001\"") || !strings.Contains(text, "\"opType\": \"U\"") {
+		t.Fatalf("详情元数据缺失: %s", text)
+	}
+	if !strings.Contains(text, "\"createdTime\": \"") {
+		t.Fatalf("详情时间字段缺失: %s", text)
+	}
+}
+
+func TestGetConfigHistoryRevisionNotFound(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config_history", map[string]any{
+		"dataId":    "gateway.yaml",
+		"historyId": "9999",
+	}, connectionPayload(t, server))
+	if !toolIsError(result) {
+		t.Fatalf("不存在的历史版本应返回错误结果: %v", result)
+	}
+	if !strings.Contains(toolText(t, result), "config revision not found") {
+		t.Fatalf("错误信息不符合预期: %s", toolText(t, result))
+	}
+}
+
+func TestGetConfigHistoryRequiresDataId(t *testing.T) {
+	server := newMockNacos(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config_history", map[string]any{}, connectionPayload(t, server))
+	if !toolIsError(result) || !strings.Contains(toolText(t, result), "dataId is required") {
+		t.Fatalf("缺少 dataId 应报错: %v", result)
+	}
+}
+
+func TestFormatMillis(t *testing.T) {
+	if got := formatMillis(0); got != "" {
+		t.Fatalf("0 应返回空串，得到 %q", got)
+	}
+	got := formatMillis(1760000000000)
+	if !strings.Contains(got, "T") || len(got) < 19 {
+		t.Fatalf("时间格式不是 RFC3339: %q", got)
 	}
 }
 

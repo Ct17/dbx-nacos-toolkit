@@ -129,6 +129,47 @@ func mcpTools() map[string]any {
 				"annotations": map[string]any{"readOnlyHint": true},
 			},
 			{
+				"name": "get_config_history",
+				"description": "List the change history of one Nacos config (who changed it and when), newest first. " +
+					"Pass a historyId from the list to fetch that revision's full content instead. " +
+					"opType values: I=insert, U=update, D=delete.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"connectionId": connectionID,
+						"dataId": map[string]any{
+							"type":        "string",
+							"description": "Config dataId, e.g. gateway.yaml",
+						},
+						"group": map[string]any{
+							"type":        "string",
+							"description": "Config group; defaults to DEFAULT_GROUP.",
+						},
+						"namespace": map[string]any{
+							"type":        "string",
+							"description": "Optional namespace id override; defaults to the connection namespace.",
+						},
+						"historyId": map[string]any{
+							"type":        "string",
+							"description": "Fetch the full content of this revision instead of listing the history.",
+						},
+						"pageNo": map[string]any{
+							"type":        "integer",
+							"description": "Page number, starting at 1 (list mode only).",
+							"minimum":     1,
+						},
+						"pageSize": map[string]any{
+							"type":        "integer",
+							"description": "Page size, 1-200 (list mode only).",
+							"minimum":     1,
+							"maximum":     200,
+						},
+					},
+					"required": []string{"connectionId", "dataId"},
+				},
+				"annotations": map[string]any{"readOnlyHint": true},
+			},
+			{
 				"name": "list_namespaces",
 				"description": "List all namespaces on the Nacos server with their config counts. " +
 					"Use this to find a namespace id before querying configs or services in that environment.",
@@ -331,6 +372,70 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 				"exists":    baseline.exists,
 			},
 			"comparisons": comparisons,
+		}, false)
+
+	case "get_config_history":
+		dataID := stringArg(arguments, "dataId")
+		if dataID == "" {
+			return toolError("dataId is required")
+		}
+		group := stringArg(arguments, "group")
+		if group == "" {
+			group = defaultGroup
+		}
+		namespace := stringArg(arguments, "namespace")
+		if namespace == "" {
+			namespace = session.namespace
+		}
+		// 指定 historyId 时进入详情模式，否则返回历史列表。
+		if historyID := stringArg(arguments, "historyId"); historyID != "" {
+			detail, err := session.client.getConfigRevision(ctx, namespace, dataID, group, historyID)
+			if err != nil {
+				return toolError(err.Error())
+			}
+			return toolJSON(map[string]any{
+				"connection":  session.name,
+				"dataId":      detail.DataID,
+				"group":       detail.Group,
+				"namespace":   namespace,
+				"historyId":   detail.ID,
+				"opType":      detail.OpType,
+				"operator":    detail.SrcUser,
+				"srcIp":       detail.SrcIP,
+				"md5":         detail.Md5,
+				"createdTime": formatMillis(detail.CreatedTime),
+				"content":     detail.Content,
+			}, false)
+		}
+		page, err := session.client.listConfigHistory(ctx, namespace, dataID, group,
+			intArg(arguments, "pageNo"), intArg(arguments, "pageSize"))
+		if err != nil {
+			return toolError(err.Error())
+		}
+		revisions := make([]map[string]any, 0, len(page.PageItems))
+		for _, revision := range page.PageItems {
+			entry := map[string]any{
+				"historyId":   revision.ID,
+				"opType":      revision.OpType,
+				"operator":    revision.SrcUser,
+				"srcIp":       revision.SrcIP,
+				"md5":         revision.Md5,
+				"createdTime": formatMillis(revision.CreatedTime),
+			}
+			if revision.CreatedTime > 0 {
+				entry["createdTimeMillis"] = revision.CreatedTime
+			}
+			revisions = append(revisions, entry)
+		}
+		return toolJSON(map[string]any{
+			"connection":     session.name,
+			"dataId":         dataID,
+			"group":          group,
+			"namespace":      namespace,
+			"totalCount":     page.TotalCount,
+			"pageNumber":     page.PageNumber,
+			"pagesAvailable": page.PagesAvailable,
+			"revisions":      revisions,
 		}, false)
 
 	case "list_namespaces":
@@ -582,6 +687,14 @@ func stringArray(values map[string]any, key string) []string {
 		}
 	}
 	return out
+}
+
+// formatMillis 把毫秒时间戳转成本地时区的 RFC3339 字符串；非法值返回空串。
+func formatMillis(millis int64) string {
+	if millis <= 0 {
+		return ""
+	}
+	return time.UnixMilli(millis).Local().Format(time.RFC3339)
 }
 
 func intArg(values map[string]any, key string) int {
