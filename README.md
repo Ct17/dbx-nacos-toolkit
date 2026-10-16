@@ -10,8 +10,8 @@ DBX 桌面端内置了 Nacos 配置浏览界面，但内置连接的 MCP 面是�
 
 | 字段           | 说明                                      |
 | ------------ | --------------------------------------- |
-| 服务地址 / 端口    | 支持 `127.0.0.1`、域名、`https://…`；默认端口 8848 |
-| Context Path | 默认 `/nacos`，自定义部署时修改                    |
+| 服务地址 / 端口    | 支持 `127.0.0.1`、域名、`https://…`，也可直接粘贴 `https://host:8848/nacos`；端口已填则不再追加，默认 8848 |
+| Context Path | 默认 `/nacos`，自定义部署时修改；地址里已带路径时以本字段为准 |
 | 命名空间 ID      | 留空为 public                              |
 | 用户名 / 密码     | Nacos 未开启鉴权时留空                          |
 
@@ -56,7 +56,7 @@ Nacos Server
 │   ├── main.go              # handler：连接生命周期 + 协议分发
 │   ├── nacos.go             # Nacos Open API 客户端
 │   ├── mcp.go               # MCP 工具定义与调用
-│   └── main_test.go         # 14 个测试（httptest 模拟 Nacos）
+│   └── main_test.go         # 22 个测试（httptest 模拟 Nacos）
 ├── scripts/smoke.py         # 协议级冒烟：模拟宿主驱动 sidecar 全链路
 ├── ui/index.html            # 工作台界面（沙箱静态页）
 ├── third_party/dbx-plugin-sdk/  # Go SDK 本地副本（go.mod replace）
@@ -107,8 +107,15 @@ npx @dbx-app/plugin-cli package .
 
 - **只读**：当前版本不提供写配置、发服务等操作（后续版本规划）
 - **仅桌面端**：DBX Web/Docker 后端不提供插件工具（官方限制）
-- **凭据**：由宿主注入 sidecar，不落盘；sidecar 仅在内存中保留连接快照
+- **凭据**：由宿主注入 sidecar，不落盘；sidecar 仅在内存中保留连接快照与活跃会话（Go 字符串无法原地清零，断开连接后随 GC 回收）。健康探测（`nacos/ping`）不携带凭据
+- **单次响应上限 2 MiB**：超过上限的响应会显式报错，而不是静默截断后交给 AI
+- **AI 可见内容**：工具结果只包含请求结果与 HTTP 状态码，上游响应正文写入插件日志，不进模型上下文
 - Nacos 需开放 Open API v1 兼容端点（1.x/2.x/3.x 均默认满足）
+
+## 性能
+
+- 同一连接的多次工具调用复用同一个 Nacos 客户端：token 与 HTTP 连接池不重复建立（仅首次调用登录一次），连接断开时缓存失效
+- 上游调用超时 15 s，单次工具调用总预算 30 s
 
 ## Roadmap
 

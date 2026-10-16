@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -11,6 +13,17 @@ import (
 
 // toolCallTimeout bounds a single tool execution (host limit is 120s).
 const toolCallTimeout = 30 * time.Second
+
+// toolResultMaxBytes keeps a tool result well below the sidecar SDK's 8 MiB
+// protocol frame limit. If a result exceeded that limit the SDK could not write
+// the response at all and the host would only see a timeout instead of an
+// error, so oversized results are reported as a readable tool error here.
+const toolResultMaxBytes = 6 << 20
+
+// sessionCacheLimit bounds the per-connection client cache. Sessions are cheap
+// to rebuild, so overflowing simply drops the cache instead of growing without
+// bound.
+const sessionCacheLimit = 64
 
 // mcpTools is the tool catalogue served to the DBX built-in AI agent and,
 // because the manifest declares `external_tools: true`, to the external dbx
@@ -243,9 +256,19 @@ type connectionSession struct {
 	name      string
 }
 
+// cachedSession is a connectionSession plus the fingerprint of the resolved
+// connection it was built from, so a stale entry is never reused after any
+// connection field (host, namespace, credentials, …) changes.
+type cachedSession struct {
+	session *connectionSession
+	key     string
+}
+
 // sessionFor resolves a connection payload (from `lifecycle.connection`) into
 // a usable client. Values missing from the payload fall back to the snapshot
-// captured at connection/connect time.
+// captured at connection/connect time. The resolved client is cached per
+// connection id so consecutive tool calls share one token and one HTTP
+// connection pool instead of logging in to Nacos on every single call.
 func (p *plugin) sessionFor(connection map[string]any) (*connectionSession, error) {
 	connectionID := stringArg(connection, "id")
 
@@ -253,48 +276,84 @@ func (p *plugin) sessionFor(connection map[string]any) (*connectionSession, erro
 	cached, hasCached := p.connections[connectionID]
 	p.mu.Unlock()
 
-	host := connectionField(connection, "host")
-	port := connectionPort(connection)
-	contextPath := connectionField(connection, "context_path")
-	namespace := connectionField(connection, "namespace")
-	username := connectionField(connection, "username")
-	password := connectionField(connection, "password")
-	name := stringArg(connection, "name")
-
+	record := connectionRecord{
+		host:        connectionField(connection, "host"),
+		port:        connectionPort(connection),
+		contextPath: connectionField(connection, "context_path"),
+		namespace:   connectionField(connection, "namespace"),
+		username:    connectionField(connection, "username"),
+		password:    connectionField(connection, "password"),
+		name:        stringArg(connection, "name"),
+	}
 	if hasCached {
-		if host == "" {
-			host = cached.host
+		if record.host == "" {
+			record.host = cached.host
 		}
-		if port == 0 {
-			port = cached.port
+		if record.port == 0 {
+			record.port = cached.port
 		}
-		if contextPath == "" {
-			contextPath = cached.contextPath
+		if record.contextPath == "" {
+			record.contextPath = cached.contextPath
 		}
-		if namespace == "" {
-			namespace = cached.namespace
+		if record.namespace == "" {
+			record.namespace = cached.namespace
 		}
-		if username == "" {
-			username = cached.username
+		if record.username == "" {
+			record.username = cached.username
 		}
-		if password == "" {
-			password = cached.password
+		if record.password == "" {
+			record.password = cached.password
 		}
-		if name == "" {
-			name = cached.name
+		if record.name == "" {
+			record.name = cached.name
 		}
 	}
-	if host == "" {
+	if record.host == "" {
 		return nil, fmt.Errorf("no usable Nacos connection: open (or re-open) a saved Nacos connection in DBX and pass its connectionId")
 	}
-	client, err := newNacosClient(host, port, contextPath, username, password)
+	key := sessionKey(record)
+
+	p.mu.Lock()
+	if entry, ok := p.sessions[connectionID]; ok && entry.key == key {
+		session := entry.session
+		p.mu.Unlock()
+		return session, nil
+	}
+	p.mu.Unlock()
+
+	client, err := newNacosClient(record.host, record.port, record.contextPath, record.username, record.password)
 	if err != nil {
 		return nil, err
 	}
-	if name == "" {
-		name = "Nacos"
+	if record.name == "" {
+		record.name = "Nacos"
 	}
-	return &connectionSession{client: client, namespace: namespace, name: name}, nil
+	session := &connectionSession{client: client, namespace: record.namespace, name: record.name}
+
+	p.mu.Lock()
+	if p.sessions == nil {
+		p.sessions = map[string]cachedSession{}
+	}
+	if len(p.sessions) >= sessionCacheLimit {
+		p.sessions = map[string]cachedSession{}
+	}
+	p.sessions[connectionID] = cachedSession{session: session, key: key}
+	p.mu.Unlock()
+	return session, nil
+}
+
+// sessionKey fingerprints a resolved connection. It is a hash so the cache key
+// never holds a second plaintext copy of the password.
+func sessionKey(record connectionRecord) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		record.host,
+		strconv.Itoa(record.port),
+		record.contextPath,
+		record.namespace,
+		record.username,
+		record.password,
+	}, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -303,6 +362,11 @@ func toolJSON(payload map[string]any, isError bool) map[string]any {
 	encoded, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return toolError("encoding result failed: " + err.Error())
+	}
+	if len(encoded) > toolResultMaxBytes {
+		return toolError(fmt.Sprintf(
+			"result is %d bytes, above the %d byte tool limit; narrow the query (fetch one dataId instead of a whole namespace)",
+			len(encoded), toolResultMaxBytes))
 	}
 	return map[string]any{
 		"content": []map[string]any{{"type": "text", "text": string(encoded)}},

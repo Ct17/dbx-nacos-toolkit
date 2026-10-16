@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -8,7 +9,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	dbxpluginsdk "github.com/t8y2/dbx/plugins/sdk/go/dbx-plugin-sdk"
 )
@@ -131,7 +134,7 @@ func connectionPayload(t *testing.T, server *httptest.Server) map[string]any {
 // --- harness ----------------------------------------------------------------
 
 func newTestPlugin() *plugin {
-	return &plugin{connections: map[string]connectionRecord{}}
+	return newPlugin()
 }
 
 func callHandle(t *testing.T, p *plugin, method string, params map[string]any) (map[string]any, *dbxpluginsdk.PluginError) {
@@ -419,5 +422,221 @@ func TestToolCatalogueRemoteNames(t *testing.T) {
 		if name != strings.ToLower(name) || strings.ContainsAny(name, "-. ") {
 			t.Errorf("tool name %q must be lowercase snake_case", name)
 		}
+	}
+}
+
+// --- regressions: security & limits -----------------------------------------
+
+// A transport failure must not carry the accessToken into the message that the
+// AI model and the UI see.
+func TestTransportErrorDoesNotLeakAccessToken(t *testing.T) {
+	const secret = "SUPER-SECRET-TOKEN"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nacos/v1/auth/login", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"accessToken":"` + secret + `","tokenTtl":18000}`))
+	})
+	mux.HandleFunc("/nacos/v1/cs/configs", func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(2 * time.Second) // force the client deadline to fire
+		_, _ = w.Write([]byte("server:\n  port: 9000\n"))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	host, port := mockHostPort(t, server.URL)
+	client, err := newNacosClient(host, port, "/nacos", "nacos", "nacos")
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	client.http.Timeout = 250 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = client.getConfig(ctx, "dev", "gateway.yaml", "")
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("access token leaked into the error message: %s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "request to") {
+		t.Fatalf("unexpected error text: %s", err.Error())
+	}
+}
+
+// An oversized upstream response must fail loudly instead of handing the model
+// a silently truncated config.
+func TestOversizedConfigIsRejectedNotTruncated(t *testing.T) {
+	big := strings.Repeat("x", int(maxResponseBytes)+10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(big))
+	}))
+	defer server.Close()
+
+	host, port := mockHostPort(t, server.URL)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "huge.yaml"}, map[string]any{
+		"id": "conn-big", "host": host, "port": float64(port), "name": "Nacos big",
+	})
+
+	if !toolIsError(result) {
+		t.Fatalf("oversized config must be an error result: %v", result)
+	}
+	if !strings.Contains(toolText(t, result), "larger than") {
+		t.Fatalf("error should explain the size limit: %s", toolText(t, result))
+	}
+}
+
+// Upstream error bodies stay out of the tool result text.
+func TestUpstreamErrorBodyIsNotEchoed(t *testing.T) {
+	const internal = "/var/nacos/internal/path"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(internal))
+	}))
+	defer server.Close()
+
+	host, port := mockHostPort(t, server.URL)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "x.yaml"}, map[string]any{
+		"id": "conn-500", "host": host, "port": float64(port), "name": "Nacos 500",
+	})
+	if strings.Contains(toolText(t, result), internal) {
+		t.Fatalf("upstream body leaked into the tool result: %s", toolText(t, result))
+	}
+	if !strings.Contains(toolText(t, result), "HTTP 500") {
+		t.Fatalf("status code should still be reported: %s", toolText(t, result))
+	}
+}
+
+// --- regressions: performance & correctness ---------------------------------
+
+func TestPageSizeIsClampedToMaximum(t *testing.T) {
+	var seen atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.Store(r.URL.Query().Get("pageSize"))
+		_, _ = w.Write([]byte(`{"totalCount":0,"pageNumber":1,"pagesAvailable":0,"pageItems":[]}`))
+	}))
+	defer server.Close()
+
+	host, port := mockHostPort(t, server.URL)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "search_configs", map[string]any{"pageSize": 500}, map[string]any{
+		"id": "conn-page", "host": host, "port": float64(port), "name": "Nacos page",
+	})
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	if got := seen.Load(); got != "200" {
+		t.Fatalf("pageSize must clamp to 200, upstream saw %v", got)
+	}
+}
+
+// Repeated tool calls on one connection must reuse the client instead of
+// logging in to Nacos every time.
+func TestToolCallsReuseCachedSession(t *testing.T) {
+	var logins int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nacos/v1/auth/login", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt64(&logins, 1)
+		_, _ = w.Write([]byte(`{"accessToken":"tok","tokenTtl":18000}`))
+	})
+	mux.HandleFunc("/nacos/v1/cs/configs", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("a: 1\n"))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	p := newTestPlugin()
+	connection := connectionPayload(t, server)
+	if _, err := callHandle(t, p, "connection/connect", map[string]any{"connection": connection}); err != nil {
+		t.Fatalf("connect: %+v", err)
+	}
+	for index := 0; index < 3; index++ {
+		result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "x.yaml"}, connection)
+		if toolIsError(result) {
+			t.Fatalf("call %d failed: %s", index, toolText(t, result))
+		}
+	}
+	if got := atomic.LoadInt64(&logins); got != 1 {
+		t.Fatalf("3 tool calls must cost 1 login, got %d", got)
+	}
+}
+
+// Disconnecting must drop the cached client, so the next call starts clean.
+func TestDisconnectDropsCachedSession(t *testing.T) {
+	var logins int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nacos/v1/auth/login", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt64(&logins, 1)
+		_, _ = w.Write([]byte(`{"accessToken":"tok","tokenTtl":18000}`))
+	})
+	mux.HandleFunc("/nacos/v1/cs/configs", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("a: 1\n"))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	p := newTestPlugin()
+	connection := connectionPayload(t, server)
+	if _, err := callHandle(t, p, "connection/connect", map[string]any{"connection": connection}); err != nil {
+		t.Fatalf("connect: %+v", err)
+	}
+	_ = callToolRaw(t, p, "get_config", map[string]any{"dataId": "x.yaml"}, connection)
+	if _, err := callHandle(t, p, "connection/disconnect", map[string]any{"connection": connection}); err != nil {
+		t.Fatalf("disconnect: %+v", err)
+	}
+	_ = callToolRaw(t, p, "get_config", map[string]any{"dataId": "x.yaml"}, connection)
+
+	if got := atomic.LoadInt64(&logins); got != 2 {
+		t.Fatalf("expected a fresh login after disconnect, got %d login(s)", got)
+	}
+}
+
+// The address field accepts full URLs and pasted context paths; the port is
+// appended only when the address does not already carry one.
+func TestServerAddressParsing(t *testing.T) {
+	cases := []struct {
+		host        string
+		port        int
+		contextPath string
+		want        string
+	}{
+		{"nacos.example.com", 8848, "", "http://nacos.example.com:8848/nacos"},
+		{"nacos.example.com:8848", 8848, "", "http://nacos.example.com:8848/nacos"},
+		{"https://nacos.example.com", 8848, "", "https://nacos.example.com:8848/nacos"},
+		{"https://nacos.example.com/nacos", 8848, "", "https://nacos.example.com:8848/nacos"},
+		{"https://nacos.example.com/nacos", 0, "", "https://nacos.example.com/nacos"},
+		{"nacos.example.com/nacos", 8848, "", "http://nacos.example.com:8848/nacos"},
+		{"http://nacos.example.com:8848/nacos", 8848, "", "http://nacos.example.com:8848/nacos"},
+		{"nacos.example.com/nacos", 8848, "/custom", "http://nacos.example.com:8848/custom"},
+		{"[::1]", 8848, "", "http://[::1]:8848/nacos"},
+		{"[::1]:8848", 8848, "", "http://[::1]:8848/nacos"},
+		{"10.0.0.1", 8848, "custom", "http://10.0.0.1:8848/custom"},
+	}
+	for _, item := range cases {
+		client, err := newNacosClient(item.host, item.port, item.contextPath, "", "")
+		if err != nil {
+			t.Errorf("%q: unexpected error: %v", item.host, err)
+			continue
+		}
+		if client.baseURL != item.want {
+			t.Errorf("%q: got %q want %q", item.host, client.baseURL, item.want)
+		}
+	}
+
+	for _, bad := range []string{"", "ftp://nacos.example.com", "https://"} {
+		if _, err := newNacosClient(bad, 8848, "", "", ""); err == nil {
+			t.Errorf("%q should be rejected", bad)
+		}
+	}
+}
+
+// truncate must count runes, not bytes, or Chinese messages get mangled.
+func TestTruncateIsRuneSafe(t *testing.T) {
+	if got := truncate("配置文件内容", 2); got != "配置…" {
+		t.Fatalf("got %q", got)
+	}
+	if got := truncate("short", 10); got != "short" {
+		t.Fatalf("got %q", got)
 	}
 }

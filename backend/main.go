@@ -32,6 +32,18 @@ type connectionRecord struct {
 type plugin struct {
 	mu          sync.Mutex
 	connections map[string]connectionRecord
+	// sessions caches one live Nacos client per connection so repeated tool
+	// calls reuse the token and the HTTP connection pool instead of logging in
+	// again on every call.
+	sessions map[string]cachedSession
+}
+
+// newPlugin builds a plugin with its maps initialized.
+func newPlugin() *plugin {
+	return &plugin{
+		connections: map[string]connectionRecord{},
+		sessions:    map[string]cachedSession{},
+	}
 }
 
 func (p *plugin) Handle(
@@ -108,7 +120,7 @@ func (p *plugin) handleConnectionConnect(values map[string]any) (any, *dbxplugin
 	return map[string]any{"success": true}, nil
 }
 
-// handleConnectionDisconnect drops the stored snapshot.
+// handleConnectionDisconnect drops the stored snapshot and the cached client.
 func (p *plugin) handleConnectionDisconnect(values map[string]any) (any, *dbxpluginsdk.PluginError) {
 	connection := mapValue(values["connection"])
 	connectionID := stringArg(connection, "id")
@@ -117,7 +129,11 @@ func (p *plugin) handleConnectionDisconnect(values map[string]any) (any, *dbxplu
 	}
 	p.mu.Lock()
 	delete(p.connections, connectionID)
+	delete(p.sessions, connectionID)
 	p.mu.Unlock()
+	// Go strings cannot be zeroed in place, so the password bytes stay on the
+	// heap until the GC reclaims them; dropping both maps shortens the window.
+	// The credential store itself belongs to the host, not to the plugin.
 	return map[string]any{"success": true}, nil
 }
 
@@ -131,7 +147,11 @@ func (p *plugin) handlePing(values map[string]any) (any, *dbxpluginsdk.PluginErr
 	if !ok {
 		return nil, dbxpluginsdk.NewError(-32010, "Open a saved Nacos connection to check its status")
 	}
-	client, err := newNacosClient(record.host, record.port, record.contextPath, record.username, record.password)
+	// The probe deliberately runs without credentials: Nacos serves its console
+	// health endpoints anonymously, and a reachability check has no reason to
+	// hand the password upstream. connection/test is the path that validates
+	// credentials.
+	client, err := newNacosClient(record.host, record.port, record.contextPath, "", "")
 	if err != nil {
 		return nil, dbxpluginsdk.NewError(-32010, err.Error())
 	}
@@ -171,7 +191,7 @@ func main() {
 		Version:      pluginVersion,
 		Capabilities: []string{"connections", "mcp"},
 	}
-	server := dbxpluginsdk.NewServer(metadata, &plugin{connections: map[string]connectionRecord{}})
+	server := dbxpluginsdk.NewServer(metadata, newPlugin())
 	if err := server.Serve(); err != nil {
 		log.Fatal(err)
 	}

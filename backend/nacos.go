@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,11 +30,17 @@ const (
 	// requestTimeout bounds every upstream HTTP call.
 	requestTimeout = 15 * time.Second
 
-	// maxResponseBytes caps how much of an upstream response is read.
-	maxResponseBytes = 4 << 20
+	// maxResponseBytes caps how much of an upstream response is read. It is
+	// deliberately conservative: a larger response is reported as an error
+	// instead of being silently truncated, and the encoded tool result has to
+	// stay below the sidecar protocol frame limit.
+	maxResponseBytes = 2 << 20
 
 	// tokenRefreshMargin re-logs in slightly before the token expires.
 	tokenRefreshMargin = 60 * time.Second
+
+	// maxPageSize is the largest page Nacos serves for list endpoints.
+	maxPageSize = 200
 )
 
 // apiError is a structured error from the Nacos API or transport layer.
@@ -55,28 +64,53 @@ type nacosClient struct {
 }
 
 // newNacosClient builds a client from connection fields.
-// host may already carry a scheme ("https://nacos.example.com"); port is
-// appended unless the host string already contains one.
+//
+// host accepts "nacos.example.com", "nacos.example.com:8848", "10.0.0.1/nacos"
+// or a full URL such as "https://nacos.example.com/nacos". The scheme selects
+// http/https, a path embedded in host becomes the fallback context path, and
+// port is appended unless the address already carries one (IPv6 aware).
 func newNacosClient(host string, port int, contextPath, username, password string) (*nacosClient, error) {
-	host = strings.TrimSpace(host)
-	if host == "" {
+	raw := strings.TrimSpace(host)
+	if raw == "" {
 		return nil, &apiError{Message: "connection has no server address"}
 	}
 	scheme := "http"
-	if strings.HasPrefix(host, "https://") {
-		scheme = "https"
-		host = strings.TrimPrefix(host, "https://")
-	} else if strings.HasPrefix(host, "http://") {
-		host = strings.TrimPrefix(host, "http://")
+	address := raw
+	embeddedPath := ""
+	if strings.Contains(raw, "://") {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Host == "" {
+			return nil, &apiError{Message: fmt.Sprintf("invalid server address %q", raw)}
+		}
+		scheme = strings.ToLower(parsed.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return nil, &apiError{Message: fmt.Sprintf("unsupported scheme %q: use http or https", parsed.Scheme)}
+		}
+		address = parsed.Host
+		embeddedPath = strings.TrimSuffix(parsed.Path, "/")
 	}
-	host = strings.TrimSuffix(host, "/")
-	if host == "" {
+	address = strings.TrimSuffix(strings.TrimSpace(address), "/")
+	// A path pasted into the address field ("nacos.example.com/nacos") would
+	// otherwise be mistaken for part of the host name.
+	if index := strings.Index(address, "/"); index >= 0 {
+		if embeddedPath == "" {
+			embeddedPath = strings.TrimSuffix(address[index:], "/")
+		}
+		address = address[:index]
+	}
+	if address == "" {
 		return nil, &apiError{Message: "connection has no server address"}
 	}
-	if port > 0 && !strings.Contains(host, ":") {
-		host = host + ":" + strconv.Itoa(port)
+	if port > 0 && !addressHasPort(address) {
+		// JoinHostPort re-adds the brackets a bare IPv6 literal needs.
+		bare := strings.TrimSuffix(strings.TrimPrefix(address, "["), "]")
+		address = net.JoinHostPort(bare, strconv.Itoa(port))
 	}
+
 	path := strings.TrimSpace(contextPath)
+	if path == "" {
+		path = embeddedPath
+	}
 	if path == "" {
 		path = defaultContextPath
 	}
@@ -86,11 +120,18 @@ func newNacosClient(host string, port int, contextPath, username, password strin
 	path = strings.TrimSuffix(path, "/")
 
 	return &nacosClient{
-		baseURL:  scheme + "://" + host + path,
+		baseURL:  scheme + "://" + address + path,
 		username: strings.TrimSpace(username),
 		password: password,
 		http:     &http.Client{Timeout: requestTimeout},
 	}, nil
+}
+
+// addressHasPort reports whether the address already carries a port. A bare
+// IPv6 literal ("[::1]") has none and still needs one appended.
+func addressHasPort(address string) bool {
+	_, _, err := net.SplitHostPort(address)
+	return err == nil
 }
 
 // --- authentication ---------------------------------------------------------
@@ -117,16 +158,23 @@ func (c *nacosClient) ensureToken(ctx context.Context) (string, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", &apiError{Message: fmt.Sprintf("login request failed: %v", err)}
+		return "", &apiError{Message: fmt.Sprintf("login request failed: %s", transportError(err))}
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	// The login body is never echoed into an error message: it carries the token.
+	body, truncated, err := readBounded(resp.Body, maxResponseBytes)
+	if err != nil {
+		return "", &apiError{Message: fmt.Sprintf("reading login response failed: %s", transportError(err))}
+	}
+	if truncated {
+		return "", &apiError{Message: "login response is unexpectedly large"}
+	}
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
 		return "", &apiError{Status: resp.StatusCode, Message: "login rejected: wrong username or password"}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", &apiError{Status: resp.StatusCode,
-			Message: fmt.Sprintf("login failed with HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))}
+			Message: fmt.Sprintf("login failed with HTTP %d", resp.StatusCode)}
 	}
 	var payload struct {
 		AccessToken string `json:"accessToken"`
@@ -137,6 +185,9 @@ func (c *nacosClient) ensureToken(ctx context.Context) (string, error) {
 	}
 	ttl := time.Duration(payload.TokenTTL) * time.Second
 	if ttl <= tokenRefreshMargin {
+		// Some Nacos builds answer tokenTtl=0 (or a value shorter than our
+		// safety margin). Assume the documented default instead of treating the
+		// token as instantly stale; a wrong guess costs one retry.
 		ttl = time.Hour
 	}
 	c.token = payload.AccessToken
@@ -155,9 +206,14 @@ func (c *nacosClient) invalidateToken() {
 // --- transport --------------------------------------------------------------
 
 // get performs an authenticated GET and retries once with a fresh token when
-// the server rejects the cached one.
+// the server rejects the cached one. 401 and 403 both retry because Nacos
+// answers an expired token with either; when the rejection is really an ACL
+// denial the retry only costs one extra login round trip.
 func (c *nacosClient) get(ctx context.Context, path string, params url.Values) ([]byte, int, error) {
 	body, status, err := c.getOnce(ctx, path, params)
+	if err != nil {
+		return body, status, err
+	}
 	if (status == http.StatusUnauthorized || status == http.StatusForbidden) && c.username != "" {
 		c.invalidateToken()
 		body, status, err = c.getOnce(ctx, path, params)
@@ -189,14 +245,55 @@ func (c *nacosClient) getOnce(ctx context.Context, path string, params url.Value
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, 0, &apiError{Message: fmt.Sprintf("request to %s failed: %v", c.baseURL, err)}
+		// transportError strips the *url.Error wrapper, whose message embeds the
+		// full request URL — including the accessToken query parameter. This
+		// message reaches the AI model and the UI, so the token must not get in.
+		return nil, 0, &apiError{Message: fmt.Sprintf("request to %s failed: %s", c.baseURL, transportError(err))}
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	body, truncated, err := readBounded(resp.Body, maxResponseBytes)
 	if err != nil {
-		return nil, resp.StatusCode, &apiError{Status: resp.StatusCode, Message: fmt.Sprintf("reading response failed: %v", err)}
+		return nil, resp.StatusCode, &apiError{Status: resp.StatusCode,
+			Message: fmt.Sprintf("reading response failed: %s", transportError(err))}
+	}
+	if truncated {
+		return nil, resp.StatusCode, &apiError{Status: resp.StatusCode,
+			Message: fmt.Sprintf("upstream response is larger than %d bytes; refusing to hand back truncated data", maxResponseBytes)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		logUpstream(fmt.Sprintf("GET %s -> HTTP %d: %s", path, resp.StatusCode, truncate(string(body), 300)))
 	}
 	return body, resp.StatusCode, nil
+}
+
+// transportError unwraps *url.Error so the returned text cannot leak the
+// request URL — and with it the accessToken query parameter.
+func transportError(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err.Error()
+	}
+	return err.Error()
+}
+
+// readBounded reads at most limit bytes and reports whether the stream was
+// longer, so callers can fail loudly instead of returning cut-off data.
+func readBounded(reader io.Reader, limit int64) ([]byte, bool, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(body)) > limit {
+		return body[:limit], true, nil
+	}
+	return body, false, nil
+}
+
+// logUpstream writes upstream error detail to stderr, which the DBX host keeps
+// in the plugin log. Response bodies stay out of error messages so they never
+// end up in the AI conversation.
+func logUpstream(detail string) {
+	fmt.Fprintf(os.Stderr, "[nacos-toolkit] %s\n", detail)
 }
 
 // --- configuration APIs -----------------------------------------------------
@@ -246,19 +343,14 @@ func (c *nacosClient) getConfig(ctx context.Context, namespace, dataID, group st
 			Message: fmt.Sprintf("config not found: dataId=%s group=%s namespace=%q", dataID, group, namespace)}
 	default:
 		return "", &apiError{Status: status,
-			Message: fmt.Sprintf("reading config failed with HTTP %d: %s", status, truncate(string(body), 200))}
+			Message: fmt.Sprintf("reading config failed with HTTP %d", status)}
 	}
 }
 
 // searchConfigs lists config metadata. Empty patterns match everything; the
 // Nacos blur search treats "*" as a wildcard.
 func (c *nacosClient) searchConfigs(ctx context.Context, namespace, dataIDPattern, groupPattern string, pageNo, pageSize int) (*configPage, error) {
-	if pageNo <= 0 {
-		pageNo = 1
-	}
-	if pageSize <= 0 || pageSize > 200 {
-		pageSize = 20
-	}
+	pageNo, pageSize = normalizePaging(pageNo, pageSize)
 	if strings.TrimSpace(dataIDPattern) == "" {
 		dataIDPattern = "*"
 	} else if !strings.Contains(dataIDPattern, "*") {
@@ -284,7 +376,7 @@ func (c *nacosClient) searchConfigs(ctx context.Context, namespace, dataIDPatter
 	}
 	if status != http.StatusOK {
 		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("listing configs failed with HTTP %d: %s", status, truncate(string(body), 200))}
+			Message: fmt.Sprintf("listing configs failed with HTTP %d", status)}
 	}
 	var page configPage
 	if err := json.Unmarshal(body, &page); err != nil {
@@ -297,6 +389,22 @@ func (c *nacosClient) searchConfigs(ctx context.Context, namespace, dataIDPatter
 	// so list responses stay small. (configItem has no content field already,
 	// this guards against future field additions.)
 	return &page, nil
+}
+
+// normalizePaging clamps caller supplied paging values. pageSize is clamped to
+// the Nacos maximum rather than silently reset to the default, so a caller that
+// asks for more than allowed still gets as much as the server will serve.
+func normalizePaging(pageNo, pageSize int) (int, int) {
+	if pageNo <= 0 {
+		pageNo = 1
+	}
+	switch {
+	case pageSize <= 0:
+		pageSize = 20
+	case pageSize > maxPageSize:
+		pageSize = maxPageSize
+	}
+	return pageNo, pageSize
 }
 
 // namespace is one Nacos namespace entry.
@@ -316,7 +424,7 @@ func (c *nacosClient) listNamespaces(ctx context.Context) ([]namespace, error) {
 	}
 	if status != http.StatusOK {
 		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("listing namespaces failed with HTTP %d: %s", status, truncate(string(body), 200))}
+			Message: fmt.Sprintf("listing namespaces failed with HTTP %d", status)}
 	}
 	var payload struct {
 		Code int         `json:"code"`
@@ -348,12 +456,7 @@ func (p *servicePage) services() []string {
 
 // listServices lists registered service names in a namespace.
 func (c *nacosClient) listServices(ctx context.Context, namespace, groupName string, pageNo, pageSize int) (*servicePage, error) {
-	if pageNo <= 0 {
-		pageNo = 1
-	}
-	if pageSize <= 0 || pageSize > 200 {
-		pageSize = 20
-	}
+	pageNo, pageSize = normalizePaging(pageNo, pageSize)
 	params := url.Values{}
 	params.Set("pageNo", strconv.Itoa(pageNo))
 	params.Set("pageSize", strconv.Itoa(pageSize))
@@ -369,7 +472,7 @@ func (c *nacosClient) listServices(ctx context.Context, namespace, groupName str
 	}
 	if status != http.StatusOK {
 		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("listing services failed with HTTP %d: %s", status, truncate(string(body), 200))}
+			Message: fmt.Sprintf("listing services failed with HTTP %d", status)}
 	}
 	var page servicePage
 	if err := json.Unmarshal(body, &page); err != nil {
@@ -408,11 +511,13 @@ func (c *nacosClient) health(ctx context.Context) (string, error) {
 	return "up", nil
 }
 
-// truncate shortens strings embedded into error messages.
+// truncate shortens strings embedded into messages. The limit counts runes so
+// multi-byte text (Chinese error messages) is never cut mid-character.
 func truncate(value string, limit int) string {
 	value = strings.TrimSpace(value)
-	if len(value) <= limit {
+	runes := []rune(value)
+	if len(runes) <= limit {
 		return value
 	}
-	return value[:limit] + "…"
+	return string(runes[:limit]) + "…"
 }
