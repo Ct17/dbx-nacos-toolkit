@@ -9,17 +9,14 @@ permissions:
 
 jobs:
   release:
-    # SECURITY: `uses:` is pinned to a branch, so the referenced workflow runs
-    # whatever code that ref points at on release day — and it holds
-    # `contents: write` on this repository. Pin it to a commit SHA instead:
+    # SECURITY: `uses:` is frozen to a commit SHA instead of a branch, because
+    # the referenced workflow holds `contents: write` on this repository and a
+    # branch ref would let upstream code change what runs on release day.
     #
-    #   t8y2/dbx/.github/workflows/plugin-release-reusable.yml@<40-char-sha>
-    #
-    # TODO(2026-10-16): the ref `plugin-sdk-v1` cannot be resolved on the public
-    # repo (no branch, no tag of that name, no reusable workflow on main), so
-    # this job fails before starting. Restore the correct ref or, better,
-    # replace it with the SHA it should be frozen at.
-    uses: t8y2/dbx/.github/workflows/plugin-release-reusable.yml@plugin-sdk-v1
+    # This is the same revision used by the official t8y2/dbx-plugin-s3
+    # workflow. Bump it consciously when DBX publishes newer reusable-workflow
+    # changes (see t8y2/dbx commits touching plugin-release-reusable.yml).
+    uses: t8y2/dbx/.github/workflows/plugin-release-reusable.yml@31ca3f773a02fabe7f23505cce93e7346c6394f8
     with:
       release-tag: ${{ github.event.release.tag_name }}
       package-command: dbx-plugin package .
