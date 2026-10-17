@@ -1,3 +1,5 @@
+[English](README.en.md) | 简体中文
+
 # Nacos Toolkit — DBX 插件
 
 在 [DBX](https://github.com/t8y2/dbx) 中连接 Nacos，并向 AI 助手开放**只读 MCP 工具**。
