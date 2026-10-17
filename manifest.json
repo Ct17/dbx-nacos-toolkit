@@ -3,9 +3,9 @@
   "manifest_version": 1,
   "id": "io.github.ct17.nacos_toolkit",
   "name": "Nacos Toolkit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "ct17",
-  "description": "Connect to Nacos from DBX and expose read-only MCP tools to AI agents: get, search, diff and inspect config history, plus namespaces, services and instances.",
+  "description": "Connect to Nacos from DBX and expose read-only MCP tools to AI agents: search config content, diff environments and history, diagnose connections, and inspect configs, namespaces, services and instances.",
   "icon": "assets/plugin.svg",
   "engines": {
     "dbx": ">=0.5.68",
@@ -112,7 +112,7 @@
     {
       "type": "mcp",
       "id": "io.github.ct17.nacos_toolkit.mcp",
-      "description": "Read-only Nacos tools: get/search/diff configs and history, list namespaces, services and instances.",
+      "description": "Read-only Nacos tools: content search, environment/history diff, connection diagnostics, config/history lookup, namespaces, services and instances.",
       "ai_tools": true,
       "external_tools": true
     }
@@ -120,7 +120,7 @@
   "localizations": {
     "zh-CN": {
       "name": "Nacos 工具箱",
-      "description": "在 DBX 中连接 Nacos，并向 AI 助手开放只读 MCP 工具：读配置、搜索配置、跨环境对比、配置历史，以及命名空间、服务与实例列表。",
+      "description": "在 DBX 中连接 Nacos，并向 AI 助手开放只读 MCP 工具：正文搜索、环境漂移、历史对比、连接体检，以及配置、命名空间、服务与实例查询。",
       "contributions": {
         "io.github.ct17.nacos_toolkit.connection": {
           "label": "Nacos 工具箱",

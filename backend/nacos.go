@@ -1,7 +1,7 @@
 package main
 
 // nacos.go —— 客户端基础设施：地址解析、协议栈探测（v1 / v3）、鉴权与
-// HTTP 传输，以及七个读取能力的分发入口。
+// HTTP 传输，以及十一个读取能力的分发入口。
 //
 // 插件支持两套协议栈，连接时自动探测：
 //
@@ -698,6 +698,32 @@ func (c *nacosClient) searchConfigs(ctx context.Context, namespace, dataIDPatter
 		return c.v3SearchConfigs(ctx, namespace, dataIDPattern, groupPattern, pageNo, pageSize)
 	}
 	return c.v1SearchConfigs(ctx, namespace, dataIDPattern, groupPattern, pageNo, pageSize)
+}
+
+// searchConfigsByContent 是 v3 控制台的正文搜索入口（Nacos 1.x/2.x 没有
+// 原生正文搜索，调用方会改走“列表 + 抓取”的回退路径）。
+func (c *nacosClient) searchConfigsByContent(ctx context.Context, namespace, dataIDPattern, groupPattern, keyword string, pageNo, pageSize int) (*configPage, error) {
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if family == familyV3 {
+		return c.v3SearchConfigsByContent(ctx, namespace, dataIDPattern, groupPattern, keyword, pageNo, pageSize)
+	}
+	return nil, &apiError{Message: "native config content search is not available on the v1 protocol stack"}
+}
+
+// serverState 读取服务端基础状态（版本/模式/鉴权开关等），供连接体检使用。
+// 两个协议栈上的状态端点都是匿名可访问的，因此这里不带凭据。
+func (c *nacosClient) serverState(ctx context.Context) (map[string]any, error) {
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if family == familyV3 {
+		return c.v3ServerState(ctx)
+	}
+	return c.v1ServerState(ctx)
 }
 
 // listConfigHistory 按 dataId 列出历史版本，最新在前。

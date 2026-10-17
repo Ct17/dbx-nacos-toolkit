@@ -25,8 +25,12 @@ DBX ships a built-in Nacos config browser, but the MCP surface of that built-in 
 | --- | --- |
 | `get_config` | Read the full config by dataId (+ group / namespace) |
 | `search_configs` | Search configs by keyword; returns paginated metadata (dataId / group / type / md5, no content) |
+| `find_in_configs` | **Content search**: find configs by a property/value keyword and return matching line snippets; v3 uses server-side `searchDetail`, v1 scans a bounded number of configs (`scanLimit`) |
 | `diff_config` | **Cross-environment diff**: compare one config across 2–8 namespaces line by line (the first is the baseline), with context-compressed output |
+| `diff_envs` | **Environment drift overview**: compare all config md5s across namespaces and report missing / extra / changed configs, optionally with content diffs for the first N changes |
 | `get_config_history` | **Config history**: list revisions (timestamp / operator / opType / md5); pass `historyId` to read the full content of that revision |
+| `diff_history` | **History diff**: compare a historical revision with the current config (or two revisions) line by line, with operator/time metadata |
+| `diagnose` | **Connection diagnostics**: check protocol, version, authentication, console port, admin initialization, namespace access and the data plane, with remediation suggestions |
 | `list_namespaces` | List all namespaces with their config counts |
 | `list_services` | List registered service names in a namespace |
 | `list_instances` | List the instances of a service (IP / port / health / weight / cluster / metadata) |
@@ -65,11 +69,13 @@ Nacos server
 │   ├── v1.go                # Nacos 1.x/2.x Open API protocol stack
 │   ├── v3.go                # Nacos 3.x native API stack (client + console)
 │   ├── mcp.go               # MCP tool definitions and dispatch
+│   ├── insights.go          # v0.3: content search / environment drift / history diff / diagnostics
 │   ├── diff.go              # line-level diff (LCS, zero dependencies)
 │   ├── main_test.go         # integration tests (httptest-mocked Nacos, v1 + v3)
+│   ├── insights_test.go     # unit tests for the four v0.3 capabilities
 │   └── diff_test.go         # diff algorithm unit tests
 ├── scripts/smoke.py         # protocol-level smoke test: drives the sidecar like a host (mock Nacos)
-├── scripts/e2e_docker.py    # real Nacos in Docker: assertions for all 7 tools + error paths + auth (v1/v3)
+├── scripts/e2e_docker.py    # real Nacos in Docker: assertions for all 11 tools + error paths + auth (v1/v3)
 ├── ui/index.html            # workbench UI (sandboxed static page)
 ├── third_party/dbx-plugin-sdk/  # local copy of the Go SDK (go.mod replace)
 └── docs/reference/          # archived development references (official docs, schema)
@@ -109,7 +115,7 @@ npx @dbx-app/plugin-cli package .
 
 ## Install and use in DBX
 
-1. Package: `dbx-plugin package .` → `dist/io.github.ct17.nacos_toolkit-0.2.0-darwin-arm64.dbxp`
+1. Package: `dbx-plugin package .` → `dist/io.github.ct17.nacos_toolkit-0.3.0-darwin-arm64.dbxp`
 2. DBX → Plugin Center → Settings → Third-party & developer options → enable "Allow unsigned development builds"
 3. Install the `.dbxp` → confirm "Nacos Toolkit" appears under Installed
 4. New connection → choose **Nacos** (provided by the plugin) → fill in the address and credentials → test the connection
@@ -144,12 +150,17 @@ Two notes for Nacos 3.x:
 
 Verified against plain Nacos 3.2.4 with no adapter: **43 end-to-end checks passed × 3 runs** (two instances: with and without auth), and 43/43 on the 2.4.3 regression. Details in `docs/e2e-nacos3-native-2026-10-17.md`.
 
+The four v0.3 tools are covered by Docker E2E as well: **55/55 checks passed on both Nacos 2.4.3 (v1) and Nacos 3.2.4 (native v3)**, including no-auth and auth instances. Details in `docs/v0.3-implementation-2026-10-17.md`.
+
 ## Known limitations
 
 - **Read-only**: this version provides no write operations (publishing configs, registering services) — planned for a later release
 - **Desktop only**: DBX Web/Docker backends do not expose plugin tools (an upstream limitation)
 - **Credentials**: injected into the sidecar by the host and never written to disk; the sidecar keeps the connection snapshot and active session in memory only (Go strings cannot be zeroed in place, so they are reclaimed by GC after disconnect). Health probing (`nacos/ping`) carries no credentials
 - **2 MiB response cap**: responses above the cap fail explicitly instead of being silently truncated and handed to the AI
+- **v1 content-search fallback**: Nacos 1.x / 2.x has no server-side content search, so `find_in_configs` lists metadata and fetches a bounded number of configs (`scanLimit` 1–1000, default 200). Incomplete results set `truncated` / `truncatedReason`; narrow dataId/group or raise the limit
+- **Large comparisons are capped**: `diff_envs` reads at most 1000 configs per namespace and returns at most 100 differences by default; it sets `truncated` explicitly instead of silently cutting data
+- **v1 drift comparison computes md5**: Nacos 2.4.3 returns `md5: null` in search results, so `diff_envs` fetches content and computes MD5 when it is missing. For large namespaces, narrow by dataId/group or lower `maxConfigsPerNamespace`
 - **What the AI sees**: tool results contain only the requested result and the HTTP status code; upstream response bodies go to the plugin log and never enter the model context
 - **Nacos protocol**: 1.x / 2.x use the v1 Open API; 3.x switches to the native v3 API automatically (3.2+ needs no legacy adapter). The v3 instance list omits instances that are down (`enabled=false`) — official Nacos semantics; v3 console endpoints require an account (see "Nacos 3.x support")
 
@@ -160,13 +171,23 @@ Verified against plain Nacos 3.2.4 with no adapter: **43 end-to-end checks passe
 
 ## Roadmap
 
+The feature backlog, prioritisation and acceptance criteria live in [`docs/feature-roadmap-2026-10-17.md`](docs/feature-roadmap-2026-10-17.md).
+
+**Delivered**
+
 - [x] `diff_config`: compare one config across namespaces/environments (the core ask in issue #11893) — v0.1.1
 - [x] `list_instances`: service instance listing — v0.1.1
 - [x] `get_config_history`: config revisions (list + single revision content) — v0.1.1
 - [x] Nacos 3.x native v3 protocol stack: auto-detection + console port / Bearer auth, no legacy adapter — v0.2.0
 - [x] `list_instances` cluster filter; `diff_config` parallel reads (2–8 namespaces in a single round trip) — v0.2.0
-- [ ] Workbench upgraded to a config browser (list / search / view)
-- [ ] Write tools (publish config with a dryRun preview + two-phase confirmation, requiring host-side manual confirmation)
+- [x] v0.3 Config Intelligence (read-only): `find_in_configs` content search, `diff_envs` environment drift, `diff_history` history diff, `diagnose` connection diagnostics — v0.3.0 (implementation notes: [`docs/v0.3-implementation-2026-10-17.md`](docs/v0.3-implementation-2026-10-17.md); 55/55 E2E checks on both v1 and v3)
+
+**Planned**
+
+- [ ] v0.3.1: custom CA / Nacos 3.x admin init / namespace name resolution; environment context; config listeners
+- [ ] v0.4 Workbench 2.0: config browser, drift matrix, service health board, AI copilot, command/context-menu entries
+- [ ] v0.5 Controlled writes: write mode/allowlist/preview/CAS/audit; promote & rollback; export & migration
+- [ ] v0.6 Live & ecosystem: change feed, GitOps baseline diff, Nacos MCP registry, tunnel support, beta/instance operations
 
 ## References
 

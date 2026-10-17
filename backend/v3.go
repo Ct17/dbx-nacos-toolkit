@@ -185,6 +185,44 @@ func (c *nacosClient) v3ReadConfig(ctx context.Context, namespace, dataID, group
 	return data.Content, true, nil
 }
 
+// v3ConfigItem / v3ConfigPage 是配置列表与正文搜索共用的响应形状。
+type v3ConfigItem struct {
+	NamespaceID string `json:"namespaceId"`
+	GroupName   string `json:"groupName"`
+	DataID      string `json:"dataId"`
+	AppName     string `json:"appName"`
+	Type        string `json:"type"`
+	Md5         string `json:"md5"`
+}
+
+type v3ConfigPage struct {
+	TotalCount     int            `json:"totalCount"`
+	PageNumber     int            `json:"pageNumber"`
+	PagesAvailable int            `json:"pagesAvailable"`
+	PageItems      []v3ConfigItem `json:"pageItems"`
+}
+
+func (data v3ConfigPage) toConfigPage() *configPage {
+	page := &configPage{
+		TotalCount:     data.TotalCount,
+		PageNumber:     data.PageNumber,
+		PagesAvailable: data.PagesAvailable,
+		PageItems:      make([]configItem, 0, len(data.PageItems)),
+	}
+	for _, item := range data.PageItems {
+		// 与 v1 保持同一输出形状：content 不在列表中携带。
+		page.PageItems = append(page.PageItems, configItem{
+			DataID:  item.DataID,
+			Group:   item.GroupName,
+			Tenant:  item.NamespaceID,
+			AppName: item.AppName,
+			Type:    item.Type,
+			Md5:     item.Md5,
+		})
+	}
+	return page
+}
+
 // v3SearchConfigs 通过控制台接口列出配置元数据。
 func (c *nacosClient) v3SearchConfigs(ctx context.Context, namespace, dataIDPattern, groupPattern string, pageNo, pageSize int) (*configPage, error) {
 	pageNo, pageSize = normalizePaging(pageNo, pageSize)
@@ -205,42 +243,62 @@ func (c *nacosClient) v3SearchConfigs(ctx context.Context, namespace, dataIDPatt
 	if err != nil {
 		return nil, err
 	}
-	type v3ConfigItem struct {
-		NamespaceID string `json:"namespaceId"`
-		GroupName   string `json:"groupName"`
-		DataID      string `json:"dataId"`
-		AppName     string `json:"appName"`
-		Type        string `json:"type"`
-		Md5         string `json:"md5"`
-	}
-	type v3ConfigPage struct {
-		TotalCount     int            `json:"totalCount"`
-		PageNumber     int            `json:"pageNumber"`
-		PagesAvailable int            `json:"pagesAvailable"`
-		PageItems      []v3ConfigItem `json:"pageItems"`
-	}
 	data, err := decodeV3Data[v3ConfigPage](payload, "listing configs")
 	if err != nil {
 		return nil, err
 	}
-	page := &configPage{
-		TotalCount:     data.TotalCount,
-		PageNumber:     data.PageNumber,
-		PagesAvailable: data.PagesAvailable,
-		PageItems:      make([]configItem, 0, len(data.PageItems)),
+	return data.toConfigPage(), nil
+}
+
+// v3SearchConfigsByContent 使用 Nacos 3.x 控制台的正文搜索接口
+// /v3/console/cs/config/searchDetail；返回的仍是元数据，正文由调用方按需抓取。
+func (c *nacosClient) v3SearchConfigsByContent(ctx context.Context, namespace, dataIDPattern, groupPattern, keyword string, pageNo, pageSize int) (*configPage, error) {
+	pageNo, pageSize = normalizePaging(pageNo, pageSize)
+	params := url.Values{}
+	params.Set("search", "blur")
+	// Nacos 3.x 的正文检索按 LIKE 模式匹配，必须带 * 通配符（例如 *port*）；
+	// 与 dataId/group 的 blur 搜索保持一致。
+	params.Set("configDetail", blurPattern(keyword))
+	params.Set("dataId", blurPattern(dataIDPattern))
+	params.Set("groupName", blurPattern(groupPattern))
+	params.Set("pageNo", strconv.Itoa(pageNo))
+	params.Set("pageSize", strconv.Itoa(pageSize))
+	if namespace != "" {
+		params.Set("namespaceId", namespace)
 	}
-	for _, item := range data.PageItems {
-		// 与 v1 保持同一输出形状：content 不在列表中携带。
-		page.PageItems = append(page.PageItems, configItem{
-			DataID:  item.DataID,
-			Group:   item.GroupName,
-			Tenant:  item.NamespaceID,
-			AppName: item.AppName,
-			Type:    item.Type,
-			Md5:     item.Md5,
-		})
+	body, status, err := c.getV3(ctx, c.consoleBase, "/v3/console/cs/config/searchDetail", params)
+	if err != nil {
+		return nil, err
 	}
-	return page, nil
+	payload, err := decodeV3(body, status, "searching config content")
+	if err != nil {
+		return nil, err
+	}
+	data, err := decodeV3Data[v3ConfigPage](payload, "searching config content")
+	if err != nil {
+		return nil, err
+	}
+	return data.toConfigPage(), nil
+}
+
+// v3ServerState 读取 /v3/console/server/state（匿名，返回平铺 map 而不是
+// Result 封装），用于连接体检与协议诊断。
+func (c *nacosClient) v3ServerState(ctx context.Context) (map[string]any, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	body, status, err := c.fetch(probeCtx, c.consoleBase, "/v3/console/server/state", nil, authNone)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, &apiError{Status: status,
+			Message: fmt.Sprintf("reading server state failed with HTTP %d", status)}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, &apiError{Message: fmt.Sprintf("unexpected server state response: %v", err)}
+	}
+	return payload, nil
 }
 
 // --- history --------------------------------------------------------------

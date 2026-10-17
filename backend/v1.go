@@ -247,6 +247,26 @@ func (c *nacosClient) v1ListInstances(ctx context.Context, namespace, groupName,
 	return &payload, nil
 }
 
+// v1ServerState 读取 /v1/console/server/state（匿名）。2.x 返回 version、
+// serverEnv、auth_enabled 等字段；1.x 的字段更少，调用方按可选字段解析。
+func (c *nacosClient) v1ServerState(ctx context.Context) (map[string]any, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	body, status, err := c.fetch(probeCtx, c.serverBase, "/v1/console/server/state", nil, authNone)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, &apiError{Status: status,
+			Message: fmt.Sprintf("reading server state failed with HTTP %d", status)}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, &apiError{Message: fmt.Sprintf("unexpected server state response: %v", err)}
+	}
+	return payload, nil
+}
+
 // v1HealthStatus probes the v1 health endpoints. Nacos 2.x+ exposes
 // /v1/console/health/readiness; 1.x only has server/state. Both are anonymous.
 func (c *nacosClient) v1HealthStatus(ctx context.Context) (string, bool) {

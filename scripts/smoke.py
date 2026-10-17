@@ -6,7 +6,8 @@ over the DBX plugin stdio protocol (JSON-RPC 2.0, one message per line)
 exactly like the DBX host does:
 
     plugin/initialize -> connection/test -> connection/connect
-    -> mcp/tools -> mcp/call (get_config / search_configs / list_services)
+    -> mcp/tools -> mcp/call (get_config / search_configs / find_in_configs /
+       diff_envs / diff_history / diagnose / list_services)
 
 Usage:
     python3 scripts/smoke.py
@@ -70,24 +71,44 @@ class MockNacos(http.server.BaseHTTPRequestHandler):
             self._json({"status": "UP"})
             return
 
+        if path == "/nacos/v1/console/server/state":
+            self._json({"version": "2.4.3", "serverEnv": "standalone", "auth_enabled": "true"})
+            return
+
         if query.get("accessToken", [""])[0] != self.token:
             self._text("user not found!", 403)
             return
 
         if path == "/nacos/v1/cs/configs":
             if query.get("search", [""])[0] == "blur":
-                self._json({
-                    "totalCount": 1,
-                    "pageNumber": 1,
-                    "pagesAvailable": 1,
-                    "pageItems": [{
-                        "dataId": "gateway.yaml",
-                        "group": "DEFAULT_GROUP",
-                        "tenant": "dev",
-                        "type": "yaml",
-                        "md5": "abc",
-                    }],
-                })
+                tenant = query.get("tenant", [""])[0]
+                if tenant == "prod":
+                    self._json({
+                        "totalCount": 2,
+                        "pageNumber": 1,
+                        "pagesAvailable": 1,
+                        "pageItems": [
+                            {"dataId": "gateway.yaml", "group": "DEFAULT_GROUP",
+                             "tenant": "prod", "type": "yaml", "md5": "def"},
+                            {"dataId": "extra.yaml", "group": "DEFAULT_GROUP",
+                             "tenant": "prod", "type": "yaml", "md5": "new"},
+                        ],
+                    })
+                elif tenant == "dev":
+                    self._json({
+                        "totalCount": 2,
+                        "pageNumber": 1,
+                        "pagesAvailable": 1,
+                        "pageItems": [
+                            {"dataId": "gateway.yaml", "group": "DEFAULT_GROUP",
+                             "tenant": "dev", "type": "yaml", "md5": "abc"},
+                            {"dataId": "stale.yaml", "group": "DEFAULT_GROUP",
+                             "tenant": "dev", "type": "yaml", "md5": "old"},
+                        ],
+                    })
+                else:
+                    self._json({"totalCount": 0, "pageNumber": 1,
+                                "pagesAvailable": 0, "pageItems": []})
                 return
             if query.get("dataId", [""])[0] == "gateway.yaml":
                 # prod 命名空间返回不同内容，供 diff_config 冒烟断言使用。
@@ -123,6 +144,14 @@ class MockNacos(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/nacos/v1/cs/history":
+            if query.get("nid", [""])[0]:
+                self._json({
+                    "id": "1001", "dataId": "gateway.yaml", "group": "DEFAULT_GROUP",
+                    "tenant": "dev", "md5": "aaa", "srcUser": "alice", "srcIp": "10.1.1.1",
+                    "opType": "U", "createdTime": 1760000000000,
+                    "content": "server:\n  port: 8999\n",
+                })
+                return
             self._json({
                 "totalCount": 1,
                 "pageNumber": 1,
@@ -244,9 +273,11 @@ def main():
             tools = sidecar.request(4, "mcp/tools", {"connectionId": "smoke-conn"})
             catalogue = tools.get("result", {}).get("tools", [])
             names = sorted(tool["name"] for tool in catalogue)
-            check("mcp/tools lists the 7 read-only tools",
-                  names == ["diff_config", "get_config", "get_config_history", "list_instances",
-                            "list_namespaces", "list_services", "search_configs"],
+            check("mcp/tools lists the 11 read-only tools",
+                  names == ["diagnose", "diff_config", "diff_envs", "diff_history",
+                            "find_in_configs", "get_config", "get_config_history",
+                            "list_instances", "list_namespaces", "list_services",
+                            "search_configs"],
                   json.dumps(names))
             check("every tool is marked readOnlyHint",
                   all(tool.get("annotations", {}).get("readOnlyHint") is True
@@ -307,7 +338,48 @@ def main():
             check("mcp/call get_config_history lists revisions",
                   '"historyId": "1001"' in text and '"operator": "alice"' in text, text)
 
-            unknown = sidecar.request(10, "does/not-exist", {})
+            content_search = sidecar.request(12, "mcp/call", {
+                "tool": "find_in_configs",
+                "arguments": {"keyword": "port: 9000"},
+                "lifecycle": {"connection": connection},
+            })
+            text = content_search.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("mcp/call find_in_configs returns a matching snippet",
+                  '"dataId": "gateway.yaml"' in text and "port: 9000" in text, text)
+            check("mcp/call find_in_configs reports scan coverage",
+                  '"candidateCount": 2' in text, text)
+
+            env_diff = sidecar.request(13, "mcp/call", {
+                "tool": "diff_envs",
+                "arguments": {"namespaces": ["dev", "prod"]},
+                "lifecycle": {"connection": connection},
+            })
+            text = env_diff.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("mcp/call diff_envs reports baseline/target drift",
+                  '"different": 1' in text and '"onlyInBaseline": 1' in text
+                  and '"onlyInTarget": 1' in text, text)
+
+            history_diff = sidecar.request(14, "mcp/call", {
+                "tool": "diff_history",
+                "arguments": {"dataId": "gateway.yaml", "fromHistoryId": "1001"},
+                "lifecycle": {"connection": connection},
+            })
+            text = history_diff.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("mcp/call diff_history compares a revision with current",
+                  '"status": "different"' in text and "+   port: 9000" in text
+                  and "-   port: 8999" in text, text)
+
+            diagnosis = sidecar.request(15, "mcp/call", {
+                "tool": "diagnose",
+                "arguments": {},
+                "lifecycle": {"connection": connection},
+            })
+            text = diagnosis.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("mcp/call diagnose reports an ok connection",
+                  '"overall": "ok"' in text and '"version": "2.4.3"' in text
+                  and '"protocol": "v1"' in text, text)
+
+            unknown = sidecar.request(16, "does/not-exist", {})
             check("unknown methods return JSON-RPC error -32601",
                   unknown.get("error", {}).get("code") == -32601,
                   json.dumps(unknown))

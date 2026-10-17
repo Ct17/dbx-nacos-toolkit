@@ -50,15 +50,22 @@ func newMockNacos(t *testing.T) *httptest.Server {
 		}
 		query := r.URL.Query()
 		if query.Get("search") == "blur" {
-			// Search endpoint: honor tenant and simple keyword filtering.
-			if query.Get("tenant") != "dev" {
+			// Search endpoint: honor tenant, so v0.3 diff_envs can exercise
+			// identical / different / only-in-baseline / only-in-target.
+			switch query.Get("tenant") {
+			case "dev", "test":
+				_, _ = w.Write([]byte(`{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+					{"dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev","type":"yaml","md5":"aaa","content":"big payload nobody wants in lists"},
+					{"dataId":"orders.yaml","group":"DEFAULT_GROUP","tenant":"dev","type":"yaml","md5":"bbb","content":"more payload"}
+				]}`))
+			case "prod":
+				_, _ = w.Write([]byte(`{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+					{"dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"prod","type":"yaml","md5":"ccc"},
+					{"dataId":"extra.yaml","group":"DEFAULT_GROUP","tenant":"prod","type":"yaml","md5":"ddd"}
+				]}`))
+			default:
 				_, _ = w.Write([]byte(`{"totalCount":0,"pageNumber":1,"pagesAvailable":0,"pageItems":[]}`))
-				return
 			}
-			_, _ = w.Write([]byte(`{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
-				{"dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev","type":"yaml","md5":"aaa","content":"big payload nobody wants in lists"},
-				{"dataId":"orders.yaml","group":"DEFAULT_GROUP","tenant":"dev","type":"yaml","md5":"bbb","content":"more payload"}
-			]}`))
 			return
 		}
 		switch {
@@ -79,6 +86,10 @@ func newMockNacos(t *testing.T) *httptest.Server {
 
 	mux.HandleFunc("/nacos/v1/console/health/readiness", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"UP"}`))
+	})
+
+	mux.HandleFunc("/nacos/v1/console/server/state", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"version":"2.4.3","serverEnv":"standalone","auth_enabled":"true","login_page_enabled":"false"}`))
 	})
 
 	mux.HandleFunc("/nacos/v1/console/namespaces", func(w http.ResponseWriter, r *http.Request) {
@@ -130,15 +141,20 @@ func newMockNacos(t *testing.T) *httptest.Server {
 			return
 		}
 		if nid := query.Get("nid"); nid != "" {
-			if nid != "1001" {
+			switch nid {
+			case "1001":
+				_, _ = w.Write([]byte(`{"id":"1001","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev",
+					"md5":"aaa","content":"server:\n  port: 8999\n","srcUser":"alice","srcIp":"10.1.1.1",
+					"opType":"U         ","createdTime":"2010-05-05T00:00:00.000+08:00",
+					"lastModifiedTime":"2026-10-17T00:15:18.031+08:00"}`))
+			case "1000":
+				_, _ = w.Write([]byte(`{"id":"1000","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev",
+					"md5":"bbb","content":"server:\n  port: 9100\n","srcUser":"bob","srcIp":"10.1.1.2",
+					"opType":"I","createdTime":1759000000000}`))
+			default:
 				w.WriteHeader(http.StatusNotFound)
 				_, _ = w.Write([]byte(`{"status":404,"message":"no config history"}`))
-				return
 			}
-			_, _ = w.Write([]byte(`{"id":"1001","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev",
-				"md5":"aaa","content":"server:\n  port: 8999\n","srcUser":"alice","srcIp":"10.1.1.1",
-				"opType":"U         ","createdTime":"2010-05-05T00:00:00.000+08:00",
-				"lastModifiedTime":"2026-10-17T00:15:18.031+08:00"}`))
 			return
 		}
 		w.WriteHeader(http.StatusBadRequest)
@@ -253,8 +269,8 @@ func TestToolCatalogue(t *testing.T) {
 		t.Fatalf("mcp/tools failed: %+v", pluginErr)
 	}
 	tools, ok := result["tools"].([]any)
-	if !ok || len(tools) != 7 {
-		t.Fatalf("expected 7 tools, got %v", result["tools"])
+	if !ok || len(tools) != 11 {
+		t.Fatalf("expected 11 tools, got %v", result["tools"])
 	}
 	names := map[string]bool{}
 	for _, entry := range tools {
@@ -270,7 +286,11 @@ func TestToolCatalogue(t *testing.T) {
 			t.Errorf("tool %v schema must declare connectionId", tool["name"])
 		}
 	}
-	for _, want := range []string{"get_config", "search_configs", "diff_config", "get_config_history", "list_namespaces", "list_services", "list_instances"} {
+	for _, want := range []string{
+		"get_config", "search_configs", "diff_config", "get_config_history",
+		"find_in_configs", "diff_envs", "diff_history", "diagnose",
+		"list_namespaces", "list_services", "list_instances",
+	} {
 		if !names[want] {
 			t.Errorf("missing tool %s", want)
 		}
@@ -796,15 +816,40 @@ func newMockNacosV3(t *testing.T) (server *httptest.Server, console *httptest.Se
 	consoleMux.HandleFunc("/v3/console/health/readiness", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":"ok"}`))
 	})
+	consoleMux.HandleFunc("/v3/console/server/state", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"version":"3.2.4","startup_mode":"standalone","auth_enabled":"true","auth_admin_request":"false","defaultMaxSize":"102400"}`))
+	})
 	consoleMux.HandleFunc("/v3/console/cs/config/list", func(w http.ResponseWriter, r *http.Request) {
 		if !consoleAuth(w, r) {
 			return
 		}
 		lastSearch.Store(r.URL.Query().Get("dataId"))
-		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
-			{"id":"1","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"gateway.yaml","md5":"aaa","type":"yaml","appName":""},
-			{"id":"2","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"orders.yaml","md5":"bbb","type":"yaml","appName":""}
-		]}}`))
+		switch r.URL.Query().Get("namespaceId") {
+		case "prod":
+			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+				{"id":"3","namespaceId":"prod","groupName":"DEFAULT_GROUP","dataId":"gateway.yaml","md5":"ccc","type":"yaml","appName":""},
+				{"id":"4","namespaceId":"prod","groupName":"DEFAULT_GROUP","dataId":"extra.yaml","md5":"ddd","type":"yaml","appName":""}
+			]}}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+				{"id":"1","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"gateway.yaml","md5":"aaa","type":"yaml","appName":""},
+				{"id":"2","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"orders.yaml","md5":"bbb","type":"yaml","appName":""}
+			]}}`))
+		}
+	})
+	consoleMux.HandleFunc("/v3/console/cs/config/searchDetail", func(w http.ResponseWriter, r *http.Request) {
+		if !consoleAuth(w, r) {
+			return
+		}
+		// Nacos 3.x 的正文检索是 LIKE 模式：必须是 *port*；mock 同时校验
+		// 通配符存在，防止回归到不带 * 的请求。
+		if detail := r.URL.Query().Get("configDetail"); strings.Contains(detail, "port") && strings.Contains(detail, "*") {
+			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"totalCount":1,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+				{"id":"1","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"gateway.yaml","md5":"aaa","type":"yaml","appName":""}
+			]}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"totalCount":0,"pageNumber":1,"pagesAvailable":0,"pageItems":[]}}`))
 	})
 	consoleMux.HandleFunc("/v3/console/cs/history/list", func(w http.ResponseWriter, r *http.Request) {
 		if !consoleAuth(w, r) {

@@ -5,7 +5,7 @@
 协议（JSON-RPC 2.0，每行一条消息），逐项验证：
 
     plugin/initialize -> connection/test -> connection/connect -> nacos/ping
-    -> mcp/tools -> mcp/call 七个工具 -> 错误路径 -> connection/disconnect
+    -> mcp/tools -> mcp/call 十一个工具 -> 错误路径 -> connection/disconnect
 
 两种测试模式：
   * v1 模式（默认）：目标为 Nacos 1.x/2.x（或 3.x 搭配 legacy adapter），
@@ -641,9 +641,10 @@ def run_base_suite(checks, sidecar, port, v3=False, console_port=None):
     tools = sidecar.request("mcp/tools", {"connectionId": "e2e-base"})
     catalogue = tools.get("result", {}).get("tools", [])
     names = sorted(tool["name"] for tool in catalogue)
-    expected = ["diff_config", "get_config", "get_config_history", "list_instances",
-                "list_namespaces", "list_services", "search_configs"]
-    checks.check("mcp/tools 返回全部 7 个工具", names == expected, json.dumps(names, ensure_ascii=False))
+    expected = ["diagnose", "diff_config", "diff_envs", "diff_history",
+                "find_in_configs", "get_config", "get_config_history",
+                "list_instances", "list_namespaces", "list_services", "search_configs"]
+    checks.check("mcp/tools 返回全部 11 个工具", names == expected, json.dumps(names, ensure_ascii=False))
     checks.check("全部工具标注 readOnlyHint（只读）",
                  bool(catalogue) and all(t.get("annotations", {}).get("readOnlyHint") is True for t in catalogue))
 
@@ -667,8 +668,8 @@ def run_base_suite(checks, sidecar, port, v3=False, console_port=None):
                  and f"API {'v3' if v3 else 'v1'}" in override_message,
                  json.dumps(override_test, ensure_ascii=False))
 
-    # --- 七个工具逐个验证 ---
-    checks.section("阶段 2：七个只读工具逐项验证")
+    # --- 十一个工具逐个验证 ---
+    checks.section("阶段 2：十一个只读工具逐项验证")
 
     call = sidecar.call_tool("get_config", {"dataId": "gateway.yaml"}, connection)
     payload = tool_json(call)
@@ -751,6 +752,87 @@ def run_base_suite(checks, sidecar, port, v3=False, console_port=None):
         checks.check("get_config_history：按 historyId 取单版本详情含内容",
                      payload.get("historyId") == first["historyId"] and bool(payload.get("content")),
                      tool_text(call))
+
+    # v0.3 F3：找一个内容与当前版本不同的历史版本，验证行级 diff。
+    # 历史列表按时间倒序；重复运行后最近若干条可能是相同内容的成对更新，
+    # 所以从末尾往前找一条内容不同的版本（而不是假设最老一条一定不同）。
+    if revisions:
+        diff_revision = None
+        for revision in reversed(revisions[-10:]):
+            detail = sidecar.call_tool("get_config_history",
+                                       {"dataId": "gateway.yaml", "historyId": revision["historyId"]},
+                                       connection)
+            detail_payload = tool_json(detail)
+            if detail_payload.get("content") and detail_payload.get("content") != GATEWAY_DEV:
+                diff_revision = revision
+                break
+        if diff_revision:
+            call = sidecar.call_tool("diff_history",
+                                     {"dataId": "gateway.yaml", "fromHistoryId": diff_revision["historyId"]},
+                                     connection)
+            payload = tool_json(call)
+            checks.check("diff_history：历史版本与当前版本对比 -> different",
+                         payload.get("status") == "different"
+                         and payload.get("from", {}).get("historyId") == diff_revision["historyId"]
+                         and bool(payload.get("diff")),
+                         tool_text(call))
+        else:
+            checks.check("diff_history：历史版本与当前版本对比 -> different", False,
+                         "no historical revision differs from the current content")
+
+    # v0.3 F1：正文搜索应命中含 "port: 9000" 的 gateway.yaml。
+    call = sidecar.call_tool("find_in_configs", {"keyword": "port: 9000"}, connection)
+    payload = tool_json(call)
+    matches = payload.get("matches", [])
+    checks.check("find_in_configs：按正文关键词命中 gateway.yaml",
+                 bool(matches) and matches[0].get("dataId") == "gateway.yaml"
+                 and any("port: 9000" in snippet.get("text", "") for snippet in matches[0].get("snippets", [])),
+                 tool_text(call))
+    checks.check("find_in_configs：返回扫描覆盖信息",
+                 isinstance(payload.get("candidateCount"), int) and payload.get("candidateCount", 0) >= 1
+                 and isinstance(payload.get("scannedConfigs"), int),
+                 tool_text(call))
+
+    # v0.3 F2：dev/test/prod 的配置漂移总览（test 的 app.properties 不同；
+    # prod 缺 app.properties 与 extra-config.json）。
+    call = sidecar.call_tool("diff_envs",
+                             {"namespaces": ["dev", "test", "prod"], "includeContentDiff": True}, connection)
+    payload = tool_json(call)
+    summaries = {entry.get("namespace"): entry for entry in payload.get("summaries", [])}
+    test_summary = summaries.get("test", {})
+    prod_summary = summaries.get("prod", {})
+    checks.check("diff_envs：test 与 dev 的漂移统计正确",
+                 test_summary.get("different") == 1 and test_summary.get("onlyInBaseline") == 1,
+                 tool_text(call))
+    checks.check("diff_envs：prod 与 dev 的漂移统计正确",
+                 prod_summary.get("different") == 1 and prod_summary.get("onlyInBaseline") == 2,
+                 tool_text(call))
+    changed = payload.get("changed", [])
+    checks.check("diff_envs：changed 同时包含 different / only-in-baseline",
+                 any(entry.get("status") == "different" for entry in changed)
+                 and any(entry.get("status") == "only-in-baseline" for entry in changed),
+                 tool_text(call))
+    prod_gateway = next((entry for entry in changed
+                         if entry.get("namespace") == "prod" and entry.get("dataId") == "gateway.yaml"), {})
+    checks.check("diff_envs：includeContentDiff 生成 gateway 行级 diff",
+                 "+   port: 8080" in prod_gateway.get("diff", "")
+                 and "-   port: 9000" in prod_gateway.get("diff", ""),
+                 tool_text(call))
+
+    # v0.3 F4：连接体检应给出协议、版本与检查项。
+    call = sidecar.call_tool("diagnose", {}, connection)
+    payload = tool_json(call)
+    server_info = payload.get("server", {})
+    checks.check("diagnose：返回协议/版本/检查项",
+                 payload.get("overall") in ("ok", "warn")
+                 and server_info.get("protocol") == ("v3" if v3 else "v1")
+                 and bool(server_info.get("version"))
+                 and bool(payload.get("checks")),
+                 tool_text(call))
+    checks.check("diagnose：健康与数据面检查通过",
+                 all(check.get("status") != "fail" for check in payload.get("checks", [])
+                     if check.get("id") in ("protocol", "health", "config-read")),
+                 tool_text(call))
 
     call = sidecar.call_tool("list_namespaces", {}, connection)
     payload = tool_json(call)

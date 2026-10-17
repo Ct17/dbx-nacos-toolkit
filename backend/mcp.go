@@ -171,6 +171,152 @@ func mcpTools() map[string]any {
 				"annotations": map[string]any{"readOnlyHint": true},
 			},
 			{
+				"name": "find_in_configs",
+				"description": "Search Nacos config *content* (not just dataId/group) and return matching line snippets. " +
+					"Use this when you know a property or value but not which config contains it. Nacos 3.x uses native " +
+					"server-side content search; Nacos 1.x/2.x scans config metadata and content up to scanLimit, so check " +
+					"truncated/truncatedReason before concluding a config does not exist.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"connectionId": connectionID,
+						"keyword": map[string]any{
+							"type":        "string",
+							"description": "Literal text to find in config content, e.g. spring.datasource.url.",
+						},
+						"namespace": map[string]any{
+							"type":        "string",
+							"description": "Optional namespace id override; defaults to the connection namespace.",
+						},
+						"dataId": map[string]any{
+							"type":        "string",
+							"description": "Optional dataId keyword to narrow the scan, e.g. gateway.",
+						},
+						"group": map[string]any{
+							"type":        "string",
+							"description": "Optional group keyword to narrow the scan.",
+						},
+						"maxResults": map[string]any{
+							"type":        "integer",
+							"description": "Maximum matching configs to return, 1-50 (default 20).",
+							"minimum":     1,
+							"maximum":     50,
+						},
+						"scanLimit": map[string]any{
+							"type":        "integer",
+							"description": "Maximum candidate configs to inspect on v1 (1-1000, default 200); ignored on v3.",
+							"minimum":     1,
+							"maximum":     1000,
+						},
+						"caseSensitive": map[string]any{
+							"type":        "boolean",
+							"description": "Match case-sensitively; defaults to false.",
+						},
+					},
+					"required": []string{"connectionId", "keyword"},
+				},
+				"annotations": map[string]any{"readOnlyHint": true},
+			},
+			{
+				"name": "diff_envs",
+				"description": "Compare all configs across two to eight namespaces by md5 and report missing, extra and " +
+					"changed configs. Use this for environment drift questions (dev vs test vs prod); follow up with " +
+					"diff_config or diff_history to inspect one config.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"connectionId": connectionID,
+						"namespaces": map[string]any{
+							"type":        "array",
+							"description": "Two to eight namespace ids; the first one is the baseline.",
+							"items":       map[string]any{"type": "string"},
+							"minItems":    2,
+							"maxItems":    8,
+						},
+						"dataId": map[string]any{
+							"type":        "string",
+							"description": "Optional dataId keyword to limit the comparison.",
+						},
+						"group": map[string]any{
+							"type":        "string",
+							"description": "Optional group keyword to limit the comparison.",
+						},
+						"includeContentDiff": map[string]any{
+							"type":        "boolean",
+							"description": "Generate line diffs for a bounded number of changed configs; defaults to false.",
+						},
+						"maxConfigsPerNamespace": map[string]any{
+							"type":        "integer",
+							"description": "Maximum configs to read per namespace, 1-2000 (default 1000).",
+							"minimum":     1,
+							"maximum":     2000,
+						},
+						"maxDifferences": map[string]any{
+							"type":        "integer",
+							"description": "Maximum difference entries to return, 1-500 (default 100).",
+							"minimum":     1,
+							"maximum":     500,
+						},
+					},
+					"required": []string{"connectionId", "namespaces"},
+				},
+				"annotations": map[string]any{"readOnlyHint": true},
+			},
+			{
+				"name": "diff_history",
+				"description": "Compare one historical revision of a config against its current content (or against another " +
+					"revision) and return a line-level diff plus operator/time metadata. Use get_config_history first to " +
+					"obtain historyId values.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"connectionId": connectionID,
+						"dataId": map[string]any{
+							"type":        "string",
+							"description": "Config dataId, e.g. gateway.yaml",
+						},
+						"group": map[string]any{
+							"type":        "string",
+							"description": "Config group; defaults to DEFAULT_GROUP.",
+						},
+						"namespace": map[string]any{
+							"type":        "string",
+							"description": "Optional namespace id override; defaults to the connection namespace.",
+						},
+						"fromHistoryId": map[string]any{
+							"type":        "string",
+							"description": "The historical revision to use as the baseline (from get_config_history).",
+						},
+						"toHistoryId": map[string]any{
+							"type":        "string",
+							"description": "Optional target revision; omit to compare against the current config.",
+						},
+						"contextLines": map[string]any{
+							"type":        "integer",
+							"description": "Context lines around each diff block, 1-10 (default 3).",
+							"minimum":     1,
+							"maximum":     10,
+						},
+					},
+					"required": []string{"connectionId", "dataId", "fromHistoryId"},
+				},
+				"annotations": map[string]any{"readOnlyHint": true},
+			},
+			{
+				"name": "diagnose",
+				"description": "Run a read-only health check of the Nacos connection: protocol stack, server version/mode, " +
+					"authentication, console port, admin initialization, namespace access and the config data plane. " +
+					"Returns per-check statuses and remediation suggestions. Use this when a Nacos tool fails or during onboarding.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"connectionId": connectionID,
+					},
+					"required": []string{"connectionId"},
+				},
+				"annotations": map[string]any{"readOnlyHint": true},
+			},
+			{
 				"name": "list_namespaces",
 				"description": "List all namespaces on the Nacos server with their config counts. " +
 					"Use this to find a namespace id before querying configs or services in that environment.",
@@ -542,6 +688,67 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 			"instances":     instances,
 		}, false)
 
+	case "find_in_configs":
+		keyword := stringArg(arguments, "keyword")
+		if keyword == "" {
+			return toolError("keyword is required")
+		}
+		namespace := stringArg(arguments, "namespace")
+		if namespace == "" {
+			namespace = session.namespace
+		}
+		result, err := p.findConfigContent(ctx, session, namespace,
+			stringArg(arguments, "dataId"), stringArg(arguments, "group"), keyword,
+			intArg(arguments, "maxResults"), intArg(arguments, "scanLimit"), boolArg(arguments, "caseSensitive"))
+		if err != nil {
+			return toolError(err.Error())
+		}
+		return toolJSON(result, false)
+
+	case "diff_envs":
+		namespaces := stringArray(arguments, "namespaces")
+		if len(namespaces) < 2 {
+			return toolError("namespaces requires at least two entries; the first one is the baseline")
+		}
+		if len(namespaces) > 8 {
+			return toolError("at most 8 namespaces per diff call")
+		}
+		result, err := p.diffEnvironments(ctx, session, namespaces,
+			stringArg(arguments, "dataId"), stringArg(arguments, "group"),
+			boolArg(arguments, "includeContentDiff"),
+			intArg(arguments, "maxConfigsPerNamespace"), intArg(arguments, "maxDifferences"))
+		if err != nil {
+			return toolError(err.Error())
+		}
+		return toolJSON(result, false)
+
+	case "diff_history":
+		dataID := stringArg(arguments, "dataId")
+		if dataID == "" {
+			return toolError("dataId is required")
+		}
+		fromHistoryID := stringArg(arguments, "fromHistoryId")
+		if fromHistoryID == "" {
+			return toolError("fromHistoryId is required")
+		}
+		group := stringArg(arguments, "group")
+		if group == "" {
+			group = defaultGroup
+		}
+		namespace := stringArg(arguments, "namespace")
+		if namespace == "" {
+			namespace = session.namespace
+		}
+		result, err := p.diffConfigHistory(ctx, session, namespace, dataID, group,
+			fromHistoryID, stringArg(arguments, "toHistoryId"), intArg(arguments, "contextLines"))
+		if err != nil {
+			return toolError(err.Error())
+		}
+		return toolJSON(result, false)
+
+	case "diagnose":
+		return toolJSON(p.diagnoseConnection(ctx, session), false)
+
 	case "":
 		return toolError("missing tool name")
 	default:
@@ -676,7 +883,7 @@ func sessionKey(record connectionRecord) string {
 
 // --- helpers ----------------------------------------------------------------
 
-func toolJSON(payload map[string]any, isError bool) map[string]any {
+func toolJSON(payload any, isError bool) map[string]any {
 	encoded, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return toolError("encoding result failed: " + err.Error())
@@ -734,6 +941,16 @@ func formatMillis(millis int64) string {
 		return ""
 	}
 	return time.UnixMilli(millis).Local().Format(time.RFC3339)
+}
+
+func boolArg(values map[string]any, key string) bool {
+	switch value := values[key].(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	}
+	return false
 }
 
 func intArg(values map[string]any, key string) int {

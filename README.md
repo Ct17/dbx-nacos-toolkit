@@ -25,8 +25,12 @@ DBX 桌面端内置了 Nacos 配置浏览界面，但内置连接的 MCP 面是�
 | ----------------- | -------------------------------------------------- |
 | `get_config`      | 按 dataId（+ group / namespace）读取配置全文                |
 | `search_configs`  | 按关键词搜索配置，返回分页元数据（dataId / group / type / md5，不含正文） |
+| `find_in_configs` | **正文搜索**：按属性/值关键词查找配置并返回命中行片段；v3 走服务端 `searchDetail`，v1 限量扫描（`scanLimit`） |
 | `diff_config`     | **跨环境对比**：同一配置在 2–8 个命名空间间逐行 diff（首个为基准），输出带上下文压缩的差异 |
+| `diff_envs`       | **环境漂移总览**：按命名空间对比全部配置的 md5，报告缺失 / 多出 / 不一致，可对前 N 条生成内容 diff |
 | `get_config_history` | **配置历史**：列出变更记录（时间 / 操作人 / opType / md5），传 `historyId` 可读该历史版本的完整内容 |
+| `diff_history`    | **历史对比**：某个历史版本 vs 当前版本（或两个历史版本）逐行 diff，附操作人/时间元数据 |
+| `diagnose`        | **连接体检**：协议、版本、鉴权、console 端口、admin 初始化、命名空间与数据面逐项检查并给出修复建议 |
 | `list_namespaces` | 列出所有命名空间及其配置数量                                     |
 | `list_services`   | 列出命名空间中的注册服务名                                      |
 | `list_instances`  | 列出某个服务的实例（IP / 端口 / 健康 / 权重 / 集群 / metadata）        |
@@ -65,11 +69,13 @@ Nacos Server
 │   ├── v1.go                # Nacos 1.x/2.x Open API 协议栈
 │   ├── v3.go                # Nacos 3.x 原生 API 协议栈（client + console）
 │   ├── mcp.go               # MCP 工具定义与调用
+│   ├── insights.go          # v0.3：正文搜索 / 环境漂移 / 历史对比 / 连接体检
 │   ├── diff.go              # 行级 diff（LCS，零依赖）
 │   ├── main_test.go         # 集成测试（httptest 模拟 Nacos，v1 + v3 双 mock）
+│   ├── insights_test.go     # v0.3 四个能力的单元测试
 │   └── diff_test.go         # diff 算法单元测试
 ├── scripts/smoke.py         # 协议级冒烟：模拟宿主驱动 sidecar 全链路（mock Nacos）
-├── scripts/e2e_docker.py    # Docker 真实 Nacos 端到端：七工具逐项断言 + 错误路径 + 鉴权链路（v1/v3 双模式）
+├── scripts/e2e_docker.py    # Docker 真实 Nacos 端到端：十一工具逐项断言 + 错误路径 + 鉴权链路（v1/v3 双模式）
 ├── ui/index.html            # 工作台界面（沙箱静态页）
 ├── third_party/dbx-plugin-sdk/  # Go SDK 本地副本（go.mod replace）
 └── docs/reference/          # 开发资料存档（官方文档、schema）
@@ -109,7 +115,7 @@ npx @dbx-app/plugin-cli package .
 
 ## 在 DBX 中安装与使用
 
-1. 打包：`dbx-plugin package .` → `dist/io.github.ct17.nacos_toolkit-0.2.0-darwin-arm64.dbxp`
+1. 打包：`dbx-plugin package .` → `dist/io.github.ct17.nacos_toolkit-0.3.0-darwin-arm64.dbxp`
 2. DBX → 插件中心 → 设置 → 第三方与开发者选项 → 开启「允许安装未签名开发包」
 3. 安装 `.dbxp` → 已安装中确认「Nacos Toolkit」
 4. 新建连接 → 选择 **Nacos**（插件提供）→ 填写地址与凭据 → 测试连接
@@ -144,12 +150,17 @@ Nacos 3.x 的两点使用提示：
 
 实测（纯 Nacos 3.2.4，无 adapter）：**43 项端到端检查全部通过 × 3 遍**（双实例：无鉴权 + 鉴权），2.4.3 回归 43/43。细节见 `docs/e2e-nacos3-native-2026-10-17.md`。
 
+v0.3 的四个新工具已加入 Docker E2E：2.4.3（v1）与 3.2.4（原生 v3）**各 55 项检查全部通过**（含无鉴权 + 鉴权实例）；细节见 `docs/v0.3-implementation-2026-10-17.md`。
+
 ## 已知限制
 
 - **只读**：当前版本不提供写配置、发服务等操作（后续版本规划）
 - **仅桌面端**：DBX Web/Docker 后端不提供插件工具（官方限制）
 - **凭据**：由宿主注入 sidecar，不落盘；sidecar 仅在内存中保留连接快照与活跃会话（Go 字符串无法原地清零，断开连接后随 GC 回收）。健康探测（`nacos/ping`）不携带凭据
 - **单次响应上限 2 MiB**：超过上限的响应会显式报错，而不是静默截断后交给 AI
+- **正文搜索的 v1 回退**：Nacos 1.x/2.x 没有服务端正文搜索接口，`find_in_configs` 会先列元数据再限量抓正文（`scanLimit` 1–1000，默认 200）；结果不完整时 `truncated`/`truncatedReason` 会显式说明，需收窄 dataId/group 或提高上限
+- **大范围对比有上限**：`diff_envs` 默认每命名空间最多 1000 条、最多返回 100 条差异；超出时显式 `truncated`，不是静默截断
+- **v1 漂移对比需要补算 md5**：Nacos 2.4.3 的搜索响应 `md5` 为 `null`，`diff_envs` 会在 md5 缺失时抓取正文计算 MD5；配置较多时请用 dataId/group 收窄或降低 `maxConfigsPerNamespace`
 - **AI 可见内容**：工具结果只包含请求结果与 HTTP 状态码，上游响应正文写入插件日志，不进模型上下文
 - **Nacos 协议**：1.x / 2.x 走 v1 Open API；3.x 自动切换原生 v3 API（3.2+ 无需 legacy adapter）。v3 的实例列表不返回已下线（`enabled=false`）实例（Nacos 官方语义）；v3 的 console 接口要求账号（见「Nacos 3.x 支持」）
 
@@ -160,13 +171,23 @@ Nacos 3.x 的两点使用提示：
 
 ## Roadmap
 
+功能候选池、优先级与验收口径见 [`docs/feature-roadmap-2026-10-17.md`](docs/feature-roadmap-2026-10-17.md)。
+
+**已交付**
+
 - [x] `diff_config`：跨命名空间/环境对比同一配置（对齐 issue #11893 的核心诉求）— v0.1.1
 - [x] `list_instances`：服务实例列表 — v0.1.1
 - [x] `get_config_history`：配置历史版本（列表 + 单版本内容）— v0.1.1
 - [x] Nacos 3.x 原生 v3 协议栈：自动探测 + console 端口/Bearer 鉴权，无需 legacy adapter — v0.2.0
 - [x] `list_instances` 支持 cluster 过滤；`diff_config` 并行读取（2–8 命名空间单次往返等待）— v0.2.0
-- [ ] 工作台升级为配置浏览器（列表 / 搜索 / 查看）
-- [ ] 写工具（发布配置、dryRun 预览 + 两阶段确认，需宿主人工确认）
+- [x] v0.3 Config Intelligence（只读）：`find_in_configs` 正文搜索、`diff_envs` 环境漂移、`diff_history` 历史对比、`diagnose` 连接体检 — v0.3.0（实现记录见 [`docs/v0.3-implementation-2026-10-17.md`](docs/v0.3-implementation-2026-10-17.md)；v1/v3 E2E 各 55 项通过）
+
+**规划中**
+
+- [ ] v0.3.1：自定义 CA / Nacos 3.x 管理员初始化 / 命名空间名解析；环境速览；配置订阅者
+- [ ] v0.4 工作台 2.0：配置浏览器、漂移矩阵、服务健康看板、AI 副驾、命令/右键入口
+- [ ] v0.5 受控写：写模式/白名单/预览/CAS/审计；提升与回滚；导出迁移
+- [ ] v0.6 实时与生态：变更监听、GitOps 基线对比、Nacos MCP 注册中心、隧道增强、Beta/实例运维
 
 ## 参考资料
 
