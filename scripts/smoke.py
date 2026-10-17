@@ -228,7 +228,8 @@ def main():
                 "port": mock_port,
                 "username": "nacos",
                 "password": "nacos",
-                "external_config": {"context_path": "/nacos", "namespace": "dev"},
+                # api_version 固定 v1：mock 是纯 v1 服务，跳过自动探测保持确定性。
+                "external_config": {"context_path": "/nacos", "namespace": "dev", "api_version": "v1"},
             }
             test = sidecar.request(2, "connection/test", {"connection": connection})
             check("connection/test succeeds against the mock",

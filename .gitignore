@@ -12,3 +12,10 @@
 *.dbxp
 .idea/
 .vscode/
+
+# Python 缓存（scripts/*.py 运行时产生）
+__pycache__/
+*.pyc
+
+# 本地归档：已过时的调查/验证记录，保留在磁盘但不随仓库发布
+/docs/archive/

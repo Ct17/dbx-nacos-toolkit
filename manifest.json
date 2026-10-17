@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.github.ct17.nacos_toolkit",
   "name": "Nacos Toolkit",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "ct17",
   "description": "Connect to Nacos from DBX and expose read-only MCP tools to AI agents: get, search, diff and inspect config history, plus namespaces, services and instances.",
   "icon": "assets/plugin.svg",
@@ -63,6 +63,21 @@
           "binding": "config"
         },
         {
+          "key": "console_port",
+          "label": "Console port",
+          "type": "number",
+          "description": "Nacos 3.x console port (default 8080, auto-detected when empty). Leave empty for Nacos 1.x/2.x.",
+          "binding": "config"
+        },
+        {
+          "key": "api_version",
+          "label": "API version",
+          "type": "text",
+          "default": "auto",
+          "description": "auto (default, recommended), v1 or v3. Override only when auto-detection picks the wrong protocol stack.",
+          "binding": "config"
+        },
+        {
           "key": "namespace",
           "label": "Namespace ID",
           "type": "text",
@@ -115,6 +130,8 @@
             "host": { "label": "服务地址" },
             "port": { "label": "端口" },
             "context_path": { "label": "Context Path", "description": "仅当 Nacos 部署在自定义 context path 下时修改。" },
+            "console_port": { "label": "Console 端口", "description": "Nacos 3.x 的控制台端口（默认 8080，留空时自动探测）；1.x/2.x 可留空。" },
+            "api_version": { "label": "API 版本", "description": "auto（默认，推荐）/ v1 / v3；仅在自动探测选错协议栈时需要手动指定。" },
             "namespace": { "label": "命名空间 ID", "description": "配置与服务查询使用的命名空间，留空表示 public。" },
             "username": { "label": "用户名", "description": "Nacos 未开启鉴权时留空。" },
             "password": { "label": "密码" }

@@ -118,7 +118,17 @@ func newMockNacos(t *testing.T) *httptest.Server {
 			return
 		}
 		query := r.URL.Query()
-		// 指定 nid 时返回单个历史版本的详情（含 content）。
+		// 复刻 Nacos 真实路由（HistoryController）：带 search=accurate 一律命中
+		// 列表方法——即使带了 nid 也返回分页列表；不带 search 且带 nid 才命中
+		// 详情方法。回归防护：详情调用若误带 search，此处返回列表结构，插件的
+		// 防御检查会报错而不是静默给出空数据。
+		if query.Get("search") == "accurate" {
+			_, _ = w.Write([]byte(`{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+				{"id":"1001","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev","md5":"aaa","srcUser":"alice","srcIp":"10.1.1.1","opType":"U         ","createdTime":"2010-05-05T00:00:00.000+08:00","lastModifiedTime":"2026-10-17T00:15:18.031+08:00"},
+				{"id":"1000","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev","md5":"bbb","srcUser":"bob","srcIp":"10.1.1.2","opType":"I","createdTime":1759000000000}
+			]}`))
+			return
+		}
 		if nid := query.Get("nid"); nid != "" {
 			if nid != "1001" {
 				w.WriteHeader(http.StatusNotFound)
@@ -127,13 +137,12 @@ func newMockNacos(t *testing.T) *httptest.Server {
 			}
 			_, _ = w.Write([]byte(`{"id":"1001","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev",
 				"md5":"aaa","content":"server:\n  port: 8999\n","srcUser":"alice","srcIp":"10.1.1.1",
-				"opType":"U","createdTime":1760000000000}`))
+				"opType":"U         ","createdTime":"2010-05-05T00:00:00.000+08:00",
+				"lastModifiedTime":"2026-10-17T00:15:18.031+08:00"}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
-			{"id":"1001","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev","md5":"aaa","srcUser":"alice","srcIp":"10.1.1.1","opType":"U","createdTime":1760000000000},
-			{"id":"1000","dataId":"gateway.yaml","group":"DEFAULT_GROUP","tenant":"dev","md5":"bbb","srcUser":"bob","srcIp":"10.1.1.2","opType":"I","createdTime":1759000000000}
-		]}`))
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"status":400,"message":"missing nid"}`))
 	})
 
 	server := httptest.NewServer(mux)
@@ -155,7 +164,8 @@ func mockHostPort(t *testing.T, rawURL string) (string, int) {
 }
 
 // connectionPayload builds a lifecycle connection object the way the host
-// injects it, pointing at the mock server.
+// injects it, pointing at the mock server. api_version 固定为 v1：这是一个纯
+// v1 mock，跳过自动探测让用例保持确定性（探测逻辑由专项用例覆盖）。
 func connectionPayload(t *testing.T, server *httptest.Server) map[string]any {
 	t.Helper()
 	host, port := mockHostPort(t, server.URL)
@@ -169,6 +179,7 @@ func connectionPayload(t *testing.T, server *httptest.Server) map[string]any {
 		"external_config": map[string]any{
 			"context_path": "/nacos",
 			"namespace":    "dev",
+			"api_version":  "v1",
 		},
 	}
 }
@@ -503,6 +514,15 @@ func TestGetConfigHistoryList(t *testing.T) {
 	if !strings.Contains(text, "\"opType\": \"U\"") || !strings.Contains(text, "\"opType\": \"I\"") {
 		t.Fatalf("操作类型未体现: %s", text)
 	}
+	// 2.4.x 形态：createdTime 是占位值，展示时间应取 lastModifiedTime；
+	// opType 经 TrimSpace 去掉定长字段的尾部空格（上面 "U"/"I" 断言已验证）。
+	if !strings.Contains(text, "2026-10-17T00:15:18") {
+		t.Fatalf("应展示 lastModifiedTime 而非占位 createdTime: %s", text)
+	}
+	// 旧版形态：毫秒数字时间戳应原样保留为 createdTimeMillis。
+	if !strings.Contains(text, "\"createdTimeMillis\": 1759000000000") {
+		t.Fatalf("旧版毫秒时间戳应保留: %s", text)
+	}
 	// 列表模式不应携带配置正文。
 	if strings.Contains(text, "port: 8999") {
 		t.Fatalf("列表模式不应返回 content: %s", text)
@@ -528,6 +548,54 @@ func TestGetConfigHistoryRevision(t *testing.T) {
 	}
 	if !strings.Contains(text, "\"createdTime\": \"") {
 		t.Fatalf("详情时间字段缺失: %s", text)
+	}
+	// 2.4.x 形态：详情时间应取 lastModifiedTime。
+	if !strings.Contains(text, "2026-10-17T00:15:18") {
+		t.Fatalf("详情应展示 lastModifiedTime: %s", text)
+	}
+}
+
+func TestFlexibleTimeUnmarshal(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want int64
+	}{
+		{`1760000000000`, 1760000000000},                   // 旧版：毫秒数字
+		{`"1760000000000"`, 1760000000000},                 // 字符串形态的毫秒数字
+		{`"2026-10-17T00:15:18.031+08:00"`, 1792167318031}, // 2.x：ISO8601（带毫秒）
+		{`"2026-10-17T00:15:18+08:00"`, 1792167318000},     // 2.x：ISO8601（无毫秒）
+		{`null`, 0},         // 缺省
+		{`""`, 0},           // 空串
+		{`"not-a-time"`, 0}, // 脏数据按无效处理，不使整体解析失败
+	}
+	for _, tc := range cases {
+		var parsed flexibleTime
+		if err := json.Unmarshal([]byte(tc.raw), &parsed); err != nil {
+			t.Fatalf("解析 %s 不应报错: %v", tc.raw, err)
+		}
+		if int64(parsed) != tc.want {
+			t.Errorf("解析 %s = %d, 期望 %d", tc.raw, int64(parsed), tc.want)
+		}
+	}
+}
+
+func TestFlexibleStringUnmarshal(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{`"1001"`, "1001"}, // 2.x：ToStringSerializer
+		{`1001`, "1001"},   // 旧版：数字 id
+		{`null`, ""},
+	}
+	for _, tc := range cases {
+		var parsed flexibleString
+		if err := json.Unmarshal([]byte(tc.raw), &parsed); err != nil {
+			t.Fatalf("解析 %s 不应报错: %v", tc.raw, err)
+		}
+		if string(parsed) != tc.want {
+			t.Errorf("解析 %s = %q, 期望 %q", tc.raw, string(parsed), tc.want)
+		}
 	}
 }
 
@@ -631,7 +699,7 @@ func TestUnreachableServer(t *testing.T) {
 		"name":            "Nacos dead",
 		"host":            "127.0.0.1",
 		"port":            float64(port),
-		"external_config": map[string]any{"context_path": "/nacos"},
+		"external_config": map[string]any{"context_path": "/nacos", "api_version": "v1"},
 	}
 	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "x.yaml"}, connection)
 	if !toolIsError(result) {
@@ -663,6 +731,362 @@ func TestToolCatalogueRemoteNames(t *testing.T) {
 	}
 }
 
+// --- v3 protocol stack (Nacos 3.x) ------------------------------------------
+
+// newMockNacosV3 starts a pair of fake servers modelling a pure Nacos 3.x
+// deployment (no legacy adapter):
+//
+//	server:  client API + login, context path /nacos
+//	console: console API on its own port, no context path, Bearer required
+//	         except for the anonymous health probe
+//
+// 响应形状逐字对齐 3.2.4 真实实例的实测输出。
+func newMockNacosV3(t *testing.T) (server *httptest.Server, console *httptest.Server, lastAuth, lastSearch *atomic.Value) {
+	t.Helper()
+	lastAuth = &atomic.Value{}
+	lastAuth.Store("")
+	lastSearch = &atomic.Value{}
+	lastSearch.Store("")
+
+	serverMux := http.NewServeMux()
+	serverMux.HandleFunc("/nacos/v3/auth/user/login", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.FormValue("username") != "nacos" || r.FormValue("password") != "nacos" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("User not found! Please check user exist or password is right!"))
+			return
+		}
+		_, _ = w.Write([]byte(`{"accessToken":"v3-token","tokenTtl":18000,"globalAdmin":true,"username":"nacos"}`))
+	})
+	serverMux.HandleFunc("/nacos/v3/client/cs/config", func(w http.ResponseWriter, r *http.Request) {
+		lastAuth.Store(r.Header.Get("Authorization"))
+		query := r.URL.Query()
+		switch {
+		case query.Get("dataId") == "gateway.yaml" && query.Get("namespaceId") == "prod":
+			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"content":"server:\n  port: 8080\nroutes:\n  - id: order\n  - id: user\n","md5":"def"}}`))
+		case query.Get("dataId") == "gateway.yaml":
+			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"content":"server:\n  port: 9000\nroutes:\n  - id: order\n","md5":"abc"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":20004,"message":"resource not found","data":null}`))
+		}
+	})
+	serverMux.HandleFunc("/nacos/v3/client/ns/instance/list", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("serviceName") != "order-service" {
+			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":[]}`))
+			return
+		}
+		// v3 的 Instance 对象没有 valid 字段。
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":[
+			{"ip":"10.0.0.1","port":8080,"weight":1,"healthy":true,"enabled":true,"ephemeral":true,"clusterName":"DEFAULT","serviceName":"DEFAULT_GROUP@@order-service","metadata":{"zone":"az1"}},
+			{"ip":"10.0.0.2","port":8080,"weight":0.5,"healthy":false,"enabled":true,"ephemeral":true,"clusterName":"DEFAULT","serviceName":"DEFAULT_GROUP@@order-service","metadata":{}}
+		]}`))
+	})
+	server = httptest.NewServer(serverMux)
+	t.Cleanup(server.Close)
+
+	consoleAuth := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("Authorization") != "Bearer v3-token" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"code":10001,"message":"access denied","data":"Code: 401, Message: User not found!"}`))
+			return false
+		}
+		return true
+	}
+	consoleMux := http.NewServeMux()
+	consoleMux.HandleFunc("/v3/console/health/readiness", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":"ok"}`))
+	})
+	consoleMux.HandleFunc("/v3/console/cs/config/list", func(w http.ResponseWriter, r *http.Request) {
+		if !consoleAuth(w, r) {
+			return
+		}
+		lastSearch.Store(r.URL.Query().Get("dataId"))
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+			{"id":"1","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"gateway.yaml","md5":"aaa","type":"yaml","appName":""},
+			{"id":"2","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"orders.yaml","md5":"bbb","type":"yaml","appName":""}
+		]}}`))
+	})
+	consoleMux.HandleFunc("/v3/console/cs/history/list", func(w http.ResponseWriter, r *http.Request) {
+		if !consoleAuth(w, r) {
+			return
+		}
+		// 真实形态：createTime 为 derby 占位值（2010），modifyTime 才是真实时间；
+		// opType 带定长尾部空格；md5 为 null。
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+			{"id":"180","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"gateway.yaml","md5":null,"type":null,"appName":"","createTime":1272988800000,"modifyTime":1792167318031,"srcIp":"10.1.1.1","srcUser":"alice","opType":"U         ","publishType":"formal"},
+			{"id":"179","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"gateway.yaml","md5":null,"type":null,"appName":"","createTime":1272988800000,"modifyTime":1759000000000,"srcIp":"10.1.1.2","srcUser":"bob","opType":"I         ","publishType":"formal"}
+		]}}`))
+	})
+	consoleMux.HandleFunc("/v3/console/cs/history", func(w http.ResponseWriter, r *http.Request) {
+		if !consoleAuth(w, r) {
+			return
+		}
+		if r.URL.Query().Get("nid") != "180" {
+			_, _ = w.Write([]byte(`{"code":20004,"message":"resource not found","data":null}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"id":"180","namespaceId":"dev","groupName":"DEFAULT_GROUP","dataId":"gateway.yaml","md5":"aba","type":null,"appName":"","createTime":1272988800000,"modifyTime":1792167318031,"srcIp":"10.1.1.1","srcUser":"alice","opType":"U         ","publishType":"formal","content":"server:\n  port: 8999\n"}}`))
+	})
+	consoleMux.HandleFunc("/v3/console/core/namespace/list", func(w http.ResponseWriter, r *http.Request) {
+		if !consoleAuth(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":[
+			{"namespace":"public","namespaceShowName":"public","configCount":1,"quota":200,"type":0},
+			{"namespace":"dev","namespaceShowName":"dev","configCount":2,"quota":200,"type":2}
+		]}`))
+	})
+	consoleMux.HandleFunc("/v3/console/ns/service/list", func(w http.ResponseWriter, r *http.Request) {
+		if !consoleAuth(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"totalCount":2,"pageNumber":1,"pagesAvailable":1,"pageItems":[
+			{"name":"order-service","groupName":"DEFAULT_GROUP"},
+			{"name":"gateway-service","groupName":"DEFAULT_GROUP"}
+		]}}`))
+	})
+	console = httptest.NewServer(consoleMux)
+	t.Cleanup(console.Close)
+	return server, console, lastAuth, lastSearch
+}
+
+// v3ConnectionPayload 构造指向 v3 mock 的连接载荷。不设置 api_version，
+// 让用例真实走一遍自动探测（控制台健康端点命中 -> v3）。
+func v3ConnectionPayload(t *testing.T, server, console *httptest.Server) map[string]any {
+	t.Helper()
+	host, port := mockHostPort(t, server.URL)
+	_, consolePort := mockHostPort(t, console.URL)
+	return map[string]any{
+		"id":       "conn-v3",
+		"name":     "Nacos v3",
+		"host":     host,
+		"port":     float64(port),
+		"username": "nacos",
+		"password": "nacos",
+		"external_config": map[string]any{
+			"context_path": "/nacos",
+			"namespace":    "dev",
+			"console_port": float64(consolePort),
+		},
+	}
+}
+
+// deadPort 返回一个刚被释放的端口，用于模拟不可达目标。
+func deadPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	return port
+}
+
+// 自动探测命中 v3，并且 client 接口带上 Bearer 头。
+func TestV3AutoDetectionAndGetConfig(t *testing.T) {
+	server, console, lastAuth, _ := newMockNacosV3(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "gateway.yaml"}, v3ConnectionPayload(t, server, console))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "port: 9000") || !strings.Contains(text, `"namespace": "dev"`) {
+		t.Fatalf("v3 config content missing: %s", text)
+	}
+	if got := lastAuth.Load(); got != "Bearer v3-token" {
+		t.Fatalf("v3 client call must attach a Bearer token, got %q", got)
+	}
+}
+
+func TestV3GetConfigNotFound(t *testing.T) {
+	server, console, _, _ := newMockNacosV3(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "nope.yaml"}, v3ConnectionPayload(t, server, console))
+	if !toolIsError(result) || !strings.Contains(toolText(t, result), "config not found") {
+		t.Fatalf("code 20004 应映射为 config not found: %v", result)
+	}
+}
+
+func TestV3SearchConfigs(t *testing.T) {
+	server, console, _, lastSearch := newMockNacosV3(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "search_configs", map[string]any{"dataId": "yaml"}, v3ConnectionPayload(t, server, console))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "gateway.yaml") || !strings.Contains(text, "orders.yaml") {
+		t.Fatalf("expected config items in result: %s", text)
+	}
+	if strings.Contains(text, "big payload") {
+		t.Fatalf("search results must not include config content: %s", text)
+	}
+	// 关键词应转换为 *kw* 的 blur 模式（v3 的 blur 搜索不会自动补通配符）。
+	if got := lastSearch.Load(); got != "*yaml*" {
+		t.Fatalf("v3 blur search must wrap the keyword, upstream saw %q", got)
+	}
+}
+
+func TestV3ListNamespaces(t *testing.T) {
+	server, console, _, _ := newMockNacosV3(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "list_namespaces", map[string]any{}, v3ConnectionPayload(t, server, console))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, `"showName": "dev"`) || !strings.Contains(text, `"configCount": 2`) {
+		t.Fatalf("namespace entries missing: %s", text)
+	}
+}
+
+func TestV3ListServices(t *testing.T) {
+	server, console, _, _ := newMockNacosV3(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "list_services", map[string]any{}, v3ConnectionPayload(t, server, console))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "order-service") || !strings.Contains(text, "gateway-service") {
+		t.Fatalf("service names missing: %s", text)
+	}
+}
+
+func TestV3ListInstances(t *testing.T) {
+	server, console, _, _ := newMockNacosV3(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "list_instances", map[string]any{
+		"serviceName": "order-service",
+	}, v3ConnectionPayload(t, server, console))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, `"instanceCount": 2`) || !strings.Contains(text, `"healthyCount": 1`) {
+		t.Fatalf("实例统计不符合预期: %s", text)
+	}
+	// v3 响应没有 valid 字段：工具输出必须省略而不是伪造 false。
+	if strings.Contains(text, `"valid"`) {
+		t.Fatalf("v3 instance output must omit the valid field: %s", text)
+	}
+	if !strings.Contains(text, `"zone": "az1"`) {
+		t.Fatalf("实例 metadata 缺失: %s", text)
+	}
+}
+
+func TestV3History(t *testing.T) {
+	server, console, _, _ := newMockNacosV3(t)
+	p := newTestPlugin()
+	result := callToolRaw(t, p, "get_config_history", map[string]any{
+		"dataId": "gateway.yaml",
+	}, v3ConnectionPayload(t, server, console))
+	if toolIsError(result) {
+		t.Fatalf("unexpected tool error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, `"totalCount": 2`) || !strings.Contains(text, `"historyId": "180"`) {
+		t.Fatalf("历史列表字段缺失: %s", text)
+	}
+	if !strings.Contains(text, `"opType": "U"`) {
+		t.Fatalf("opType 应清除定长空格: %s", text)
+	}
+	// derby 占位 createTime（2010）绝不能出现在展示时间中；应取 modifyTime。
+	if strings.Contains(text, "2010") || !strings.Contains(text, "2026-10-17T00:15:18") {
+		t.Fatalf("展示时间应取 modifyTime: %s", text)
+	}
+	// 详情：nid=180 命中，返回内容。
+	result = callToolRaw(t, p, "get_config_history", map[string]any{
+		"dataId": "gateway.yaml", "historyId": "180",
+	}, v3ConnectionPayload(t, server, console))
+	if toolIsError(result) || !strings.Contains(toolText(t, result), "port: 8999") {
+		t.Fatalf("v3 历史详情应返回内容: %v", result)
+	}
+	// 不存在的 nid -> 资源不存在错误。
+	result = callToolRaw(t, p, "get_config_history", map[string]any{
+		"dataId": "gateway.yaml", "historyId": "999",
+	}, v3ConnectionPayload(t, server, console))
+	if !toolIsError(result) || !strings.Contains(toolText(t, result), "not found") {
+		t.Fatalf("不存在的历史版本应报错: %v", result)
+	}
+}
+
+// v3 + 无凭据：console 接口的 403 必须翻译成可操作的错误提示。
+func TestV3ConsoleRequiresCredentials(t *testing.T) {
+	server, console, _, _ := newMockNacosV3(t)
+	p := newTestPlugin()
+	connection := v3ConnectionPayload(t, server, console)
+	delete(connection, "username")
+	delete(connection, "password")
+	result := callToolRaw(t, p, "search_configs", map[string]any{}, connection)
+	if !toolIsError(result) {
+		t.Fatalf("匿名 console 调用应报错: %v", result)
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "access denied") || !strings.Contains(text, "403") {
+		t.Fatalf("错误提示应说明鉴权要求: %s", text)
+	}
+}
+
+// v3 + 错误密码：登录拒绝信息应包含可读原因。
+func TestV3WrongCredentials(t *testing.T) {
+	server, console, _, _ := newMockNacosV3(t)
+	p := newTestPlugin()
+	connection := v3ConnectionPayload(t, server, console)
+	connection["password"] = "wrong"
+	result := callToolRaw(t, p, "search_configs", map[string]any{}, connection)
+	if !toolIsError(result) || !strings.Contains(toolText(t, result), "wrong username or password") {
+		t.Fatalf("错误密码应返回登录拒绝提示: %v", result)
+	}
+}
+
+// 自动探测在 v3 探针失败时回退 v1（覆盖 Nacos 2.x 与无 console 端口配置的场景）。
+func TestAutoDetectionFallbackToV1(t *testing.T) {
+	server := newMockNacos(t)
+	host, port := mockHostPort(t, server.URL)
+	connection := map[string]any{
+		"id": "conn-auto-v1", "name": "auto",
+		"host": host, "port": float64(port),
+		"username": "nacos", "password": "nacos",
+		"external_config": map[string]any{
+			"context_path": "/nacos",
+			"namespace":    "dev",
+			"console_port": float64(deadPort(t)),
+		},
+	}
+	p := newTestPlugin()
+	if _, pluginErr := callHandle(t, p, "connection/connect", map[string]any{"connection": connection}); pluginErr != nil {
+		t.Fatalf("connect: %+v", pluginErr)
+	}
+	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "gateway.yaml"}, connection)
+	if toolIsError(result) {
+		t.Fatalf("v1 回退失败: %s", toolText(t, result))
+	}
+	ping, pluginErr := callHandle(t, p, "nacos/ping", map[string]any{"connectionId": "conn-auto-v1"})
+	if pluginErr != nil {
+		t.Fatalf("ping: %+v", pluginErr)
+	}
+	if ping["api"] != "v1" {
+		t.Fatalf("探测结果应为 v1，得到 %v", ping["api"])
+	}
+}
+
+// 双探针都失败时，错误信息应引导用户检查 console 端口。
+func TestDetectionErrorHintsConsolePort(t *testing.T) {
+	p := newTestPlugin()
+	connection := map[string]any{
+		"id": "conn-nowhere", "name": "nowhere",
+		"host": "127.0.0.1", "port": float64(deadPort(t)),
+		"external_config": map[string]any{"context_path": "/nacos"},
+	}
+	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "x.yaml"}, connection)
+	if !toolIsError(result) || !strings.Contains(toolText(t, result), "console port") {
+		t.Fatalf("探测失败应提示 console 端口: %v", result)
+	}
+}
+
 // --- regressions: security & limits -----------------------------------------
 
 // A transport failure must not carry the accessToken into the message that the
@@ -681,7 +1105,10 @@ func TestTransportErrorDoesNotLeakAccessToken(t *testing.T) {
 	defer server.Close()
 
 	host, port := mockHostPort(t, server.URL)
-	client, err := newNacosClient(host, port, "/nacos", "nacos", "nacos")
+	client, err := newNacosClient(clientOptions{
+		host: host, port: port, contextPath: "/nacos",
+		apiVersion: "v1", username: "nacos", password: "nacos",
+	})
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
@@ -714,6 +1141,7 @@ func TestOversizedConfigIsRejectedNotTruncated(t *testing.T) {
 	p := newTestPlugin()
 	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "huge.yaml"}, map[string]any{
 		"id": "conn-big", "host": host, "port": float64(port), "name": "Nacos big",
+		"external_config": map[string]any{"api_version": "v1"},
 	})
 
 	if !toolIsError(result) {
@@ -737,6 +1165,7 @@ func TestUpstreamErrorBodyIsNotEchoed(t *testing.T) {
 	p := newTestPlugin()
 	result := callToolRaw(t, p, "get_config", map[string]any{"dataId": "x.yaml"}, map[string]any{
 		"id": "conn-500", "host": host, "port": float64(port), "name": "Nacos 500",
+		"external_config": map[string]any{"api_version": "v1"},
 	})
 	if strings.Contains(toolText(t, result), internal) {
 		t.Fatalf("upstream body leaked into the tool result: %s", toolText(t, result))
@@ -758,14 +1187,15 @@ func TestPageSizeIsClampedToMaximum(t *testing.T) {
 
 	host, port := mockHostPort(t, server.URL)
 	p := newTestPlugin()
-	result := callToolRaw(t, p, "search_configs", map[string]any{"pageSize": 500}, map[string]any{
+	result := callToolRaw(t, p, "search_configs", map[string]any{"pageSize": 999}, map[string]any{
 		"id": "conn-page", "host": host, "port": float64(port), "name": "Nacos page",
+		"external_config": map[string]any{"api_version": "v1"},
 	})
 	if toolIsError(result) {
 		t.Fatalf("unexpected tool error: %s", toolText(t, result))
 	}
-	if got := seen.Load(); got != "200" {
-		t.Fatalf("pageSize must clamp to 200, upstream saw %v", got)
+	if got := seen.Load(); got != "500" {
+		t.Fatalf("pageSize must clamp to 500, upstream saw %v", got)
 	}
 }
 
@@ -852,19 +1282,43 @@ func TestServerAddressParsing(t *testing.T) {
 		{"10.0.0.1", 8848, "custom", "http://10.0.0.1:8848/custom"},
 	}
 	for _, item := range cases {
-		client, err := newNacosClient(item.host, item.port, item.contextPath, "", "")
+		client, err := newNacosClient(clientOptions{host: item.host, port: item.port, contextPath: item.contextPath})
 		if err != nil {
 			t.Errorf("%q: unexpected error: %v", item.host, err)
 			continue
 		}
-		if client.baseURL != item.want {
-			t.Errorf("%q: got %q want %q", item.host, client.baseURL, item.want)
+		if client.serverBase != item.want {
+			t.Errorf("%q: got %q want %q", item.host, client.serverBase, item.want)
 		}
 	}
 
 	for _, bad := range []string{"", "ftp://nacos.example.com", "https://"} {
-		if _, err := newNacosClient(bad, 8848, "", "", ""); err == nil {
+		if _, err := newNacosClient(clientOptions{host: bad, port: 8848}); err == nil {
 			t.Errorf("%q should be rejected", bad)
+		}
+	}
+}
+
+// consoleBase 由 server 地址派生出同主机、独立端口、无 context path 的基址。
+func TestConsoleBaseDerivation(t *testing.T) {
+	cases := []struct {
+		host        string
+		port        int
+		consolePort int
+		want        string
+	}{
+		{"https://nacos.example.com/nacos", 8848, 18080, "https://nacos.example.com:18080"},
+		{"nacos.example.com:8848", 8848, 0, "http://nacos.example.com:8080"}, // 未配置按默认 8080
+		{"[::1]:8848", 8848, 9090, "http://[::1]:9090"},
+	}
+	for _, item := range cases {
+		client, err := newNacosClient(clientOptions{host: item.host, port: item.port, consolePort: item.consolePort})
+		if err != nil {
+			t.Errorf("%q: unexpected error: %v", item.host, err)
+			continue
+		}
+		if client.consoleBase != item.want {
+			t.Errorf("%q: consoleBase got %q want %q", item.host, client.consoleBase, item.want)
 		}
 	}
 }

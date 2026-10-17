@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -90,9 +91,9 @@ func mcpTools() map[string]any {
 						},
 						"pageSize": map[string]any{
 							"type":        "integer",
-							"description": "Page size, 1-200.",
+							"description": "Page size, 1-500.",
 							"minimum":     1,
-							"maximum":     200,
+							"maximum":     500,
 						},
 					},
 					"required": []string{"connectionId"},
@@ -160,9 +161,9 @@ func mcpTools() map[string]any {
 						},
 						"pageSize": map[string]any{
 							"type":        "integer",
-							"description": "Page size, 1-200 (list mode only).",
+							"description": "Page size, 1-500 (list mode only).",
 							"minimum":     1,
-							"maximum":     200,
+							"maximum":     500,
 						},
 					},
 					"required": []string{"connectionId", "dataId"},
@@ -201,9 +202,9 @@ func mcpTools() map[string]any {
 						},
 						"pageSize": map[string]any{
 							"type":        "integer",
-							"description": "Page size, 1-200.",
+							"description": "Page size, 1-500.",
 							"minimum":     1,
-							"maximum":     200,
+							"maximum":     500,
 						},
 					},
 					"required": []string{"connectionId"},
@@ -226,6 +227,10 @@ func mcpTools() map[string]any {
 						"groupName": map[string]any{
 							"type":        "string",
 							"description": "Optional service group; defaults to DEFAULT_GROUP.",
+						},
+						"cluster": map[string]any{
+							"type":        "string",
+							"description": "Optional cluster name filter, e.g. DEFAULT.",
 						},
 						"namespace": map[string]any{
 							"type":        "string",
@@ -319,20 +324,31 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 			return toolError("at most 8 namespaces per diff call")
 		}
 
-		// 先逐个读取所有命名空间的配置内容，再统一生成对比结果；
-		// 任一命名空间读取失败（网络/权限）直接作为工具错误返回。
+		// 并行读取所有命名空间的配置内容（2-8 个），再统一生成对比结果。
+		// 远端服务器下可把 n 次往返压缩为 1 次往返耗时；任一命名空间读取
+		// 失败（网络/权限）直接作为工具错误返回（按命名空间顺序取首个错误，
+		// 保证信息稳定可复现）。
 		type reading struct {
 			namespace string
 			content   string
 			exists    bool
+			err       error
 		}
-		readings := make([]reading, 0, len(namespaces))
-		for _, namespace := range namespaces {
-			content, exists, err := session.client.readConfig(ctx, namespace, dataID, group)
-			if err != nil {
-				return toolError(fmt.Sprintf("reading namespace %q failed: %v", namespace, err))
+		readings := make([]reading, len(namespaces))
+		var waitGroup sync.WaitGroup
+		for index, namespace := range namespaces {
+			waitGroup.Add(1)
+			go func(index int, namespace string) {
+				defer waitGroup.Done()
+				content, exists, err := session.client.readConfig(ctx, namespace, dataID, group)
+				readings[index] = reading{namespace: namespace, content: content, exists: exists, err: err}
+			}(index, namespace)
+		}
+		waitGroup.Wait()
+		for _, item := range readings {
+			if item.err != nil {
+				return toolError(fmt.Sprintf("reading namespace %q failed: %v", item.namespace, item.err))
 			}
-			readings = append(readings, reading{namespace: namespace, content: content, exists: exists})
 		}
 
 		baseline := readings[0]
@@ -398,12 +414,12 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 				"dataId":      detail.DataID,
 				"group":       detail.Group,
 				"namespace":   namespace,
-				"historyId":   detail.ID,
-				"opType":      detail.OpType,
+				"historyId":   string(detail.ID),
+				"opType":      strings.TrimSpace(detail.OpType),
 				"operator":    detail.SrcUser,
 				"srcIp":       detail.SrcIP,
 				"md5":         detail.Md5,
-				"createdTime": formatMillis(detail.CreatedTime),
+				"createdTime": formatMillis(detail.revisionTime()),
 				"content":     detail.Content,
 			}, false)
 		}
@@ -414,16 +430,17 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 		}
 		revisions := make([]map[string]any, 0, len(page.PageItems))
 		for _, revision := range page.PageItems {
+			at := revision.revisionTime()
 			entry := map[string]any{
-				"historyId":   revision.ID,
-				"opType":      revision.OpType,
+				"historyId":   string(revision.ID),
+				"opType":      strings.TrimSpace(revision.OpType),
 				"operator":    revision.SrcUser,
 				"srcIp":       revision.SrcIP,
 				"md5":         revision.Md5,
-				"createdTime": formatMillis(revision.CreatedTime),
+				"createdTime": formatMillis(at),
 			}
-			if revision.CreatedTime > 0 {
-				entry["createdTimeMillis"] = revision.CreatedTime
+			if at > 0 {
+				entry["createdTimeMillis"] = at
 			}
 			revisions = append(revisions, entry)
 		}
@@ -487,7 +504,8 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 		if groupName == "" {
 			groupName = defaultGroup
 		}
-		page, err := session.client.listInstances(ctx, namespace, groupName, serviceName)
+		page, err := session.client.listInstances(ctx, namespace, groupName, serviceName,
+			stringArg(arguments, "cluster"))
 		if err != nil {
 			return toolError(err.Error())
 		}
@@ -502,9 +520,12 @@ func (p *plugin) callTool(params map[string]any) map[string]any {
 				"port":    host.Port,
 				"healthy": host.Healthy,
 				"enabled": host.Enabled,
-				"valid":   host.Valid,
 				"weight":  host.Weight,
 				"cluster": host.ClusterName,
+			}
+			// valid 只在服务端提供时输出（v1 响应有该字段，v3 的 Instance 没有）。
+			if host.Valid != nil {
+				entry["valid"] = *host.Valid
 			}
 			if len(host.Metadata) > 0 {
 				entry["metadata"] = host.Metadata
@@ -558,8 +579,10 @@ func (p *plugin) sessionFor(connection map[string]any) (*connectionSession, erro
 	record := connectionRecord{
 		host:        connectionField(connection, "host"),
 		port:        connectionPort(connection),
+		consolePort: connectionIntField(connection, "console_port"),
 		contextPath: connectionField(connection, "context_path"),
 		namespace:   connectionField(connection, "namespace"),
+		apiVersion:  connectionField(connection, "api_version"),
 		username:    connectionField(connection, "username"),
 		password:    connectionField(connection, "password"),
 		name:        stringArg(connection, "name"),
@@ -571,11 +594,17 @@ func (p *plugin) sessionFor(connection map[string]any) (*connectionSession, erro
 		if record.port == 0 {
 			record.port = cached.port
 		}
+		if record.consolePort == 0 {
+			record.consolePort = cached.consolePort
+		}
 		if record.contextPath == "" {
 			record.contextPath = cached.contextPath
 		}
 		if record.namespace == "" {
 			record.namespace = cached.namespace
+		}
+		if record.apiVersion == "" {
+			record.apiVersion = cached.apiVersion
 		}
 		if record.username == "" {
 			record.username = cached.username
@@ -600,7 +629,15 @@ func (p *plugin) sessionFor(connection map[string]any) (*connectionSession, erro
 	}
 	p.mu.Unlock()
 
-	client, err := newNacosClient(record.host, record.port, record.contextPath, record.username, record.password)
+	client, err := newNacosClient(clientOptions{
+		host:        record.host,
+		port:        record.port,
+		contextPath: record.contextPath,
+		consolePort: record.consolePort,
+		apiVersion:  record.apiVersion,
+		username:    record.username,
+		password:    record.password,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -627,8 +664,10 @@ func sessionKey(record connectionRecord) string {
 	sum := sha256.Sum256([]byte(strings.Join([]string{
 		record.host,
 		strconv.Itoa(record.port),
+		strconv.Itoa(record.consolePort),
 		record.contextPath,
 		record.namespace,
+		record.apiVersion,
 		record.username,
 		record.password,
 	}, "\x00")))
@@ -730,11 +769,17 @@ func connectionField(connection map[string]any, key string) string {
 }
 
 func connectionPort(connection map[string]any) int {
-	if port := intArg(connection, "port"); port > 0 {
-		return port
+	return connectionIntField(connection, "port")
+}
+
+// connectionIntField 读取连接载荷中的整数配置，先查顶层字段，再回退到
+// `binding: "config"` 字段所在的 external_config 映射。
+func connectionIntField(connection map[string]any, key string) int {
+	if value := intArg(connection, key); value > 0 {
+		return value
 	}
 	if ext := mapValue(connection["external_config"]); len(ext) > 0 {
-		return intArg(ext, "port")
+		return intArg(ext, key)
 	}
 	return 0
 }

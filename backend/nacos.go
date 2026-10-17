@@ -1,5 +1,17 @@
 package main
 
+// nacos.go —— 客户端基础设施：地址解析、协议栈探测（v1 / v3）、鉴权与
+// HTTP 传输，以及七个读取能力的分发入口。
+//
+// 插件支持两套协议栈，连接时自动探测：
+//
+//	v1：Nacos 1.x / 2.x 的 Open API（3.x 搭配 legacy adapter 时也走这条）；
+//	v3：Nacos 3.x 原生 API —— client 接口在服务端口（/v3/client/**），
+//	    console 接口在独立的控制台端口（/v3/console/**，除健康检查外强制
+//	    Bearer 鉴权，即使服务端关闭了鉴权开关）。
+//
+// 具体实现分别见 v1.go 与 v3.go。仅使用标准库，零第三方依赖。
+
 import (
 	"context"
 	"encoding/json"
@@ -16,19 +28,22 @@ import (
 	"time"
 )
 
-// The plugin talks to Nacos through the Open API v1 compatible endpoints,
-// which Nacos 1.x, 2.x and 3.x all serve. Only the standard library is used:
-// no Nacos SDK dependency keeps the sidecar small and portable.
-
 const (
-	// defaultGroup is the Nacos default config group.
+	// defaultGroup is the Nacos default config/service group.
 	defaultGroup = "DEFAULT_GROUP"
 
 	// defaultContextPath is the standard Nacos context path.
 	defaultContextPath = "/nacos"
 
+	// defaultConsolePort 是 Nacos 3.x 控制台（console API）的默认端口。
+	// 连接未显式配置 console 端口时，探测阶段会在该端口尝试一次。
+	defaultConsolePort = 8080
+
 	// requestTimeout bounds every upstream HTTP call.
 	requestTimeout = 15 * time.Second
+
+	// probeTimeout bounds each protocol-detection probe.
+	probeTimeout = 5 * time.Second
 
 	// maxResponseBytes caps how much of an upstream response is read. It is
 	// deliberately conservative: a larger response is reported as an error
@@ -39,8 +54,10 @@ const (
 	// tokenRefreshMargin re-logs in slightly before the token expires.
 	tokenRefreshMargin = 60 * time.Second
 
-	// maxPageSize is the largest page Nacos serves for list endpoints.
-	maxPageSize = 200
+	// maxPageSize 是列表接口接受的最大分页大小。取值与 Nacos 3.x console
+	// 历史接口的服务端上限（500）一致；1.x/2.x 对更大的值也不再报错，
+	// 这里统一按 500 收敛，避免生成超出单次工具结果预算的响应。
+	maxPageSize = 500
 )
 
 // apiError is a structured error from the Nacos API or transport layer.
@@ -51,9 +68,71 @@ type apiError struct {
 
 func (e *apiError) Error() string { return e.Message }
 
-// nacosClient is a minimal Nacos Open API client.
+// --- 协议栈 ---------------------------------------------------------------
+
+// apiFamily 标识客户端使用的 Nacos API 协议栈。
+type apiFamily int
+
+const (
+	// familyAuto 表示尚未探测，按连接配置在 v3/v1 之间自动判定。
+	familyAuto apiFamily = iota
+	// familyV1 是 Nacos 1.x/2.x Open API 栈。
+	familyV1
+	// familyV3 是 Nacos 3.x 原生 API 栈。
+	familyV3
+)
+
+func (f apiFamily) name() string {
+	switch f {
+	case familyV1:
+		return "v1"
+	case familyV3:
+		return "v3"
+	default:
+		return "auto"
+	}
+}
+
+// parseAPIVersion 解析连接上的 api_version 覆盖值（auto / v1 / v3）。
+func parseAPIVersion(raw string) apiFamily {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "v1", "1":
+		return familyV1
+	case "v3", "3":
+		return familyV3
+	default:
+		return familyAuto
+	}
+}
+
+// authStyle 选择请求携带凭据的方式。
+type authStyle int
+
+const (
+	// authNone：不带凭据（探测类请求）。
+	authNone authStyle = iota
+	// authQuery：v1 方式，accessToken 查询参数。
+	authQuery
+	// authBearer：v3 方式，Authorization: Bearer 头。
+	authBearer
+)
+
+// nacosClient is a minimal Nacos Open API client covering both the v1 and the
+// v3 protocol stacks.
 type nacosClient struct {
-	baseURL  string // scheme://host:port + context path, no trailing slash
+	// serverBase 是服务端口基址（含 context path），如 http://host:8848/nacos。
+	serverBase string
+	// consoleBase 是 Nacos 3.x 控制台基址（无 context path），如 http://host:8080。
+	consoleBase string
+	// consolePortConfigured 记录 console 端口是否来自连接配置：未配置时
+	// 探测失败的错误信息要提示用户补充端口。
+	consolePortConfigured bool
+
+	// familyPref 来自连接的显式覆盖；family 是探测结果（二者都由 familyMu 保护）。
+	familyPref apiFamily
+	familyMu   sync.Mutex
+	family     apiFamily
+
 	username string
 	password string
 	http     *http.Client
@@ -63,14 +142,25 @@ type nacosClient struct {
 	tokenExpiry time.Time
 }
 
+// clientOptions 是新客户端的全部输入。
+type clientOptions struct {
+	host        string
+	port        int
+	contextPath string
+	consolePort int    // 0 表示未配置（探测时按默认 8080 尝试）
+	apiVersion  string // 空 / auto / v1 / v3
+	username    string
+	password    string
+}
+
 // newNacosClient builds a client from connection fields.
 //
 // host accepts "nacos.example.com", "nacos.example.com:8848", "10.0.0.1/nacos"
 // or a full URL such as "https://nacos.example.com/nacos". The scheme selects
 // http/https, a path embedded in host becomes the fallback context path, and
 // port is appended unless the address already carries one (IPv6 aware).
-func newNacosClient(host string, port int, contextPath, username, password string) (*nacosClient, error) {
-	raw := strings.TrimSpace(host)
+func newNacosClient(opts clientOptions) (*nacosClient, error) {
+	raw := strings.TrimSpace(opts.host)
 	if raw == "" {
 		return nil, &apiError{Message: "connection has no server address"}
 	}
@@ -101,13 +191,13 @@ func newNacosClient(host string, port int, contextPath, username, password strin
 	if address == "" {
 		return nil, &apiError{Message: "connection has no server address"}
 	}
-	if port > 0 && !addressHasPort(address) {
+	if opts.port > 0 && !addressHasPort(address) {
 		// JoinHostPort re-adds the brackets a bare IPv6 literal needs.
 		bare := strings.TrimSuffix(strings.TrimPrefix(address, "["), "]")
-		address = net.JoinHostPort(bare, strconv.Itoa(port))
+		address = net.JoinHostPort(bare, strconv.Itoa(opts.port))
 	}
 
-	path := strings.TrimSpace(contextPath)
+	path := strings.TrimSpace(opts.contextPath)
 	if path == "" {
 		path = embeddedPath
 	}
@@ -119,11 +209,25 @@ func newNacosClient(host string, port int, contextPath, username, password strin
 	}
 	path = strings.TrimSuffix(path, "/")
 
+	// console 基址：与 server 同主机、独立端口、无 context path。
+	consolePort := opts.consolePort
+	if consolePort <= 0 {
+		consolePort = defaultConsolePort
+	}
+	consoleHost := address
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		consoleHost = host
+	}
+	consoleHost = strings.TrimSuffix(strings.TrimPrefix(consoleHost, "["), "]")
+
 	return &nacosClient{
-		baseURL:  scheme + "://" + address + path,
-		username: strings.TrimSpace(username),
-		password: password,
-		http:     &http.Client{Timeout: requestTimeout},
+		serverBase:            scheme + "://" + address + path,
+		consoleBase:           scheme + "://" + net.JoinHostPort(consoleHost, strconv.Itoa(consolePort)),
+		consolePortConfigured: opts.consolePort > 0,
+		familyPref:            parseAPIVersion(opts.apiVersion),
+		username:              strings.TrimSpace(opts.username),
+		password:              opts.password,
+		http:                  &http.Client{Timeout: requestTimeout},
 	}, nil
 }
 
@@ -132,6 +236,48 @@ func newNacosClient(host string, port int, contextPath, username, password strin
 func addressHasPort(address string) bool {
 	_, _, err := net.SplitHostPort(address)
 	return err == nil
+}
+
+// resolveFamily 决定使用哪套协议栈：连接显式指定时直接采用；否则先探测
+// v3 控制台健康端点（Nacos 3.x），失败再退回 v1 健康端点（1.x/2.x 以及
+// 搭配 legacy adapter 的 3.x）。探测结果缓存，失败不缓存以便重试。
+func (c *nacosClient) resolveFamily(ctx context.Context) (apiFamily, error) {
+	if c.familyPref != familyAuto {
+		return c.familyPref, nil
+	}
+	c.familyMu.Lock()
+	defer c.familyMu.Unlock()
+	if c.family != familyAuto {
+		return c.family, nil
+	}
+	if c.checkV3Readiness(ctx) {
+		c.family = familyV3
+		return c.family, nil
+	}
+	if _, ok := c.v1HealthStatus(ctx); ok {
+		c.family = familyV1
+		return c.family, nil
+	}
+	return familyAuto, &apiError{Message: c.detectionError()}
+}
+
+// resolvedFamilyName 返回已解析的协议栈名称（用于诊断输出，如 ping）。
+func (c *nacosClient) resolvedFamilyName() string {
+	c.familyMu.Lock()
+	defer c.familyMu.Unlock()
+	if c.family != familyAuto {
+		return c.family.name()
+	}
+	return c.familyPref.name()
+}
+
+func (c *nacosClient) detectionError() string {
+	hint := ""
+	if !c.consolePortConfigured {
+		hint = fmt.Sprintf("; if this is Nacos 3.x, set the console port (default %d)", defaultConsolePort)
+	}
+	return fmt.Sprintf("cannot reach Nacos: v3 console health (%s) and v1 health (%s) both failed%s",
+		c.consoleBase, c.serverBase, hint)
 }
 
 // --- authentication ---------------------------------------------------------
@@ -147,11 +293,23 @@ func (c *nacosClient) ensureToken(ctx context.Context) (string, error) {
 	if c.token != "" && time.Now().Before(c.tokenExpiry) {
 		return c.token, nil
 	}
+
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return "", err
+	}
+	// v3 的登录端点（/v3/auth/user/login）与 v1 登录端点（/v1/auth/login，
+	// 3.x 里同为原生保留）都挂在服务端口上，响应字段一致。
+	loginPath := "/v1/auth/login"
+	if family == familyV3 {
+		loginPath = "/v3/auth/user/login"
+	}
+
 	form := url.Values{}
 	form.Set("username", c.username)
 	form.Set("password", c.password)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/v1/auth/login", strings.NewReader(form.Encode()))
+		c.serverBase+loginPath, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", &apiError{Message: err.Error()}
 	}
@@ -170,7 +328,13 @@ func (c *nacosClient) ensureToken(ctx context.Context) (string, error) {
 		return "", &apiError{Message: "login response is unexpectedly large"}
 	}
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-		return "", &apiError{Status: resp.StatusCode, Message: "login rejected: wrong username or password"}
+		message := "login rejected: wrong username or password"
+		if family == familyV3 {
+			// Nacos 3.x 的 console API 始终要求登录；无鉴权实例也需要先
+			// 初始化管理员账号，这里把可操作提示带上。
+			message += " (Nacos 3.x console APIs always require an account; if this server has no admin user yet, initialize one via POST /v3/auth/user/admin)"
+		}
+		return "", &apiError{Status: resp.StatusCode, Message: message}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", &apiError{Status: resp.StatusCode,
@@ -179,8 +343,13 @@ func (c *nacosClient) ensureToken(ctx context.Context) (string, error) {
 	var payload struct {
 		AccessToken string `json:"accessToken"`
 		TokenTTL    int    `json:"tokenTtl"`
+		Code        *int   `json:"code"`
+		Message     string `json:"message"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil || payload.AccessToken == "" {
+		if payload.Code != nil && *payload.Code != 0 {
+			return "", &apiError{Message: fmt.Sprintf("login failed: %s (code %d)", payload.Message, *payload.Code)}
+		}
 		return "", &apiError{Message: "login response did not contain an access token; is authentication really enabled?"}
 	}
 	ttl := time.Duration(payload.TokenTTL) * time.Second
@@ -205,26 +374,15 @@ func (c *nacosClient) invalidateToken() {
 
 // --- transport --------------------------------------------------------------
 
-// get performs an authenticated GET and retries once with a fresh token when
-// the server rejects the cached one. 401 and 403 both retry because Nacos
-// answers an expired token with either; when the rejection is really an ACL
-// denial the retry only costs one extra login round trip.
-func (c *nacosClient) get(ctx context.Context, path string, params url.Values) ([]byte, int, error) {
-	body, status, err := c.getOnce(ctx, path, params)
-	if err != nil {
-		return body, status, err
-	}
-	if (status == http.StatusUnauthorized || status == http.StatusForbidden) && c.username != "" {
-		c.invalidateToken()
-		body, status, err = c.getOnce(ctx, path, params)
-	}
-	return body, status, err
-}
-
-func (c *nacosClient) getOnce(ctx context.Context, path string, params url.Values) ([]byte, int, error) {
-	token, err := c.ensureToken(ctx)
-	if err != nil {
-		return nil, 0, err
+// fetch performs one GET against base, attaching credentials per style.
+func (c *nacosClient) fetch(ctx context.Context, base, path string, params url.Values, style authStyle) ([]byte, int, error) {
+	token := ""
+	if style != authNone {
+		var err error
+		token, err = c.ensureToken(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
 	}
 	query := url.Values{}
 	for key, values := range params {
@@ -232,10 +390,10 @@ func (c *nacosClient) getOnce(ctx context.Context, path string, params url.Value
 			query.Add(key, value)
 		}
 	}
-	if token != "" {
+	if style == authQuery && token != "" {
 		query.Set("accessToken", token)
 	}
-	requestURL := c.baseURL + path
+	requestURL := base + path
 	if encoded := query.Encode(); encoded != "" {
 		requestURL += "?" + encoded
 	}
@@ -243,12 +401,15 @@ func (c *nacosClient) getOnce(ctx context.Context, path string, params url.Value
 	if err != nil {
 		return nil, 0, &apiError{Message: err.Error()}
 	}
+	if style == authBearer && token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		// transportError strips the *url.Error wrapper, whose message embeds the
 		// full request URL — including the accessToken query parameter. This
 		// message reaches the AI model and the UI, so the token must not get in.
-		return nil, 0, &apiError{Message: fmt.Sprintf("request to %s failed: %s", c.baseURL, transportError(err))}
+		return nil, 0, &apiError{Message: fmt.Sprintf("request to %s failed: %s", base, transportError(err))}
 	}
 	defer resp.Body.Close()
 	body, truncated, err := readBounded(resp.Body, maxResponseBytes)
@@ -264,6 +425,33 @@ func (c *nacosClient) getOnce(ctx context.Context, path string, params url.Value
 		logUpstream(fmt.Sprintf("GET %s -> HTTP %d: %s", path, resp.StatusCode, truncate(string(body), 300)))
 	}
 	return body, resp.StatusCode, nil
+}
+
+// fetchAuthed performs an authenticated GET and retries once with a fresh
+// token when the server rejects the cached one. 401 and 403 both retry because
+// Nacos answers an expired token with either; when the rejection is really an
+// ACL denial the retry only costs one extra login round trip.
+func (c *nacosClient) fetchAuthed(ctx context.Context, base, path string, params url.Values, style authStyle) ([]byte, int, error) {
+	body, status, err := c.fetch(ctx, base, path, params, style)
+	if err != nil {
+		return body, status, err
+	}
+	if (status == http.StatusUnauthorized || status == http.StatusForbidden) && c.username != "" {
+		c.invalidateToken()
+		body, status, err = c.fetch(ctx, base, path, params, style)
+	}
+	return body, status, err
+}
+
+// get 是 v1 栈对 serverBase 的带鉴权 GET（accessToken 查询参数）。
+func (c *nacosClient) get(ctx context.Context, path string, params url.Values) ([]byte, int, error) {
+	return c.fetchAuthed(ctx, c.serverBase, path, params, authQuery)
+}
+
+// getV3 是 v3 栈的带鉴权 GET（Bearer 头），base 由调用方选择
+// serverBase（client 接口）或 consoleBase（console 接口）。
+func (c *nacosClient) getV3(ctx context.Context, base, path string, params url.Values) ([]byte, int, error) {
+	return c.fetchAuthed(ctx, base, path, params, authBearer)
 }
 
 // transportError unwraps *url.Error so the returned text cannot leak the
@@ -296,7 +484,7 @@ func logUpstream(detail string) {
 	fmt.Fprintf(os.Stderr, "[nacos-toolkit] %s\n", detail)
 }
 
-// --- configuration APIs -----------------------------------------------------
+// --- shared response types --------------------------------------------------
 
 // configPage is the paginated result of a config search.
 type configPage struct {
@@ -317,121 +505,97 @@ type configItem struct {
 	Md5     string `json:"md5"`
 }
 
-// readConfig 读取单条配置。exists 为 false 表示该配置不存在（404），
-// 与网络或权限错误区分开——跨环境对比需要把"缺少配置"当作一种正常状态处理。
-func (c *nacosClient) readConfig(ctx context.Context, namespace, dataID, group string) (content string, exists bool, err error) {
-	if strings.TrimSpace(dataID) == "" {
-		return "", false, &apiError{Message: "dataId is required"}
-	}
-	if group == "" {
-		group = defaultGroup
-	}
-	params := url.Values{}
-	params.Set("dataId", dataID)
-	params.Set("group", group)
-	if namespace != "" {
-		params.Set("tenant", namespace)
-	}
-	body, status, err := c.get(ctx, "/v1/cs/configs", params)
-	if err != nil {
-		return "", false, err
-	}
-	switch status {
-	case http.StatusOK:
-		return string(body), true, nil
-	case http.StatusNotFound:
-		return "", false, nil
-	default:
-		return "", false, &apiError{Status: status,
-			Message: fmt.Sprintf("reading config failed with HTTP %d", status)}
-	}
-}
+// flexibleTime 表示来自 Nacos 的时间戳，兼容接口的多种返回形态：
+// 毫秒数字（旧版）、毫秒数字字符串、ISO8601 字符串（2.x 将 java.sql.Timestamp
+// 序列化后的形态，例如 "2026-10-17T00:15:18.031+08:00"）。
+// 统一按毫秒存储；无法解析时按 0 处理，避免单条脏数据使整个列表解析失败。
+type flexibleTime int64
 
-// getConfig returns the full content of one config.
-func (c *nacosClient) getConfig(ctx context.Context, namespace, dataID, group string) (string, error) {
-	content, exists, err := c.readConfig(ctx, namespace, dataID, group)
-	if err != nil {
-		return "", err
-	}
-	if !exists {
-		return "", &apiError{Status: http.StatusNotFound,
-			Message: fmt.Sprintf("config not found: dataId=%s group=%s namespace=%q", dataID, group, namespace)}
-	}
-	return content, nil
-}
-
-// searchConfigs lists config metadata. Empty patterns match everything; the
-// Nacos blur search treats "*" as a wildcard.
-func (c *nacosClient) searchConfigs(ctx context.Context, namespace, dataIDPattern, groupPattern string, pageNo, pageSize int) (*configPage, error) {
-	pageNo, pageSize = normalizePaging(pageNo, pageSize)
-	if strings.TrimSpace(dataIDPattern) == "" {
-		dataIDPattern = "*"
-	} else if !strings.Contains(dataIDPattern, "*") {
-		dataIDPattern = "*" + dataIDPattern + "*"
-	}
-	if strings.TrimSpace(groupPattern) == "" {
-		groupPattern = "*"
-	} else if !strings.Contains(groupPattern, "*") {
-		groupPattern = "*" + groupPattern + "*"
-	}
-	params := url.Values{}
-	params.Set("search", "blur")
-	params.Set("dataId", dataIDPattern)
-	params.Set("group", groupPattern)
-	params.Set("pageNo", strconv.Itoa(pageNo))
-	params.Set("pageSize", strconv.Itoa(pageSize))
-	if namespace != "" {
-		params.Set("tenant", namespace)
-	}
-	body, status, err := c.get(ctx, "/v1/cs/configs", params)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("listing configs failed with HTTP %d", status)}
-	}
-	var page configPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		return nil, &apiError{Message: fmt.Sprintf("unexpected search response: %v", err)}
-	}
-	if page.PageItems == nil {
-		page.PageItems = []configItem{}
-	}
-	// Defensive: the search endpoint may echo config content per item; drop it
-	// so list responses stay small. (configItem has no content field already,
-	// this guards against future field additions.)
-	return &page, nil
-}
-
-// normalizePaging clamps caller supplied paging values. pageSize is clamped to
-// the Nacos maximum rather than silently reset to the default, so a caller that
-// asks for more than allowed still gets as much as the server will serve.
-func normalizePaging(pageNo, pageSize int) (int, int) {
-	if pageNo <= 0 {
-		pageNo = 1
-	}
+func (t *flexibleTime) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
 	switch {
-	case pageSize <= 0:
-		pageSize = 20
-	case pageSize > maxPageSize:
-		pageSize = maxPageSize
+	case raw == "" || raw == "null":
+		*t = 0
+	case raw[0] == '"':
+		unquoted, err := strconv.Unquote(raw)
+		if err != nil {
+			*t = 0
+			return nil
+		}
+		*t = parseTimeValue(unquoted)
+	default:
+		if millis, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			*t = flexibleTime(millis)
+		} else {
+			*t = 0
+		}
 	}
-	return pageNo, pageSize
+	return nil
 }
 
-// configRevision 是一条配置变更历史记录（对齐 /v1/cs/history 响应字段）。
+// parseTimeValue 解析字符串形态的时间值：纯毫秒数或 ISO8601 时间。
+func parseTimeValue(value string) flexibleTime {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if millis, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return flexibleTime(millis)
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return flexibleTime(parsed.UnixMilli())
+	}
+	return 0
+}
+
+// flexibleString 兼容字符串与数字两种 JSON 形态。历史记录的 id 字段即是这种
+// 情况：2.x/3.x 用 ToStringSerializer 序列化为字符串，更早的实现则直接输出数字。
+type flexibleString string
+
+func (s *flexibleString) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		*s = ""
+		return nil
+	}
+	if raw[0] == '"' {
+		var value string
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		*s = flexibleString(value)
+		return nil
+	}
+	*s = flexibleString(raw)
+	return nil
+}
+
+// configRevision 是一条配置变更历史记录。
+// 字段兼容性：不同版本的 createdTime 可能是毫秒数字或 ISO8601 字符串；
+// 2.x/3.x 起新增 lastModifiedTime（v3 console 里叫 modifyTime，由 v3 栈适配），
+// 且部分存储形态（derby）下 createdTime 是占位值（2010-05-05），
+// 真实变更时间以 lastModifiedTime 为准。
 type configRevision struct {
-	ID          string `json:"id"`
-	DataID      string `json:"dataId"`
-	Group       string `json:"group"`
-	Tenant      string `json:"tenant"`
-	AppName     string `json:"appName"`
-	Md5         string `json:"md5"`
-	SrcIP       string `json:"srcIp"`
-	SrcUser     string `json:"srcUser"`
-	OpType      string `json:"opType"` // I 新增 / U 更新 / D 删除
-	CreatedTime int64  `json:"createdTime"`
+	ID               flexibleString `json:"id"`
+	DataID           string         `json:"dataId"`
+	Group            string         `json:"group"`
+	Tenant           string         `json:"tenant"`
+	AppName          string         `json:"appName"`
+	Md5              string         `json:"md5"`
+	SrcIP            string         `json:"srcIp"`
+	SrcUser          string         `json:"srcUser"`
+	OpType           string         `json:"opType"` // I 新增 / U 更新 / D 删除
+	CreatedTime      flexibleTime   `json:"createdTime"`
+	LastModifiedTime flexibleTime   `json:"lastModifiedTime"`
+}
+
+// revisionTime 返回该历史条目的展示时间（毫秒）。
+// lastModifiedTime 有效时优先，否则退回 createdTime（旧版本只有该字段）。
+func (r configRevision) revisionTime() int64 {
+	if r.LastModifiedTime > 0 {
+		return int64(r.LastModifiedTime)
+	}
+	return int64(r.CreatedTime)
 }
 
 // configRevisionDetail 是单个历史版本的详情（含配置内容）。
@@ -448,72 +612,6 @@ type configHistoryPage struct {
 	PageItems      []configRevision `json:"pageItems"`
 }
 
-// listConfigHistory 按 dataId 列出历史版本，最新在前。
-func (c *nacosClient) listConfigHistory(ctx context.Context, namespace, dataID, group string, pageNo, pageSize int) (*configHistoryPage, error) {
-	if strings.TrimSpace(dataID) == "" {
-		return nil, &apiError{Message: "dataId is required"}
-	}
-	pageNo, pageSize = normalizePaging(pageNo, pageSize)
-	params := url.Values{}
-	params.Set("search", "accurate")
-	params.Set("dataId", dataID)
-	params.Set("group", group)
-	if namespace != "" {
-		params.Set("tenant", namespace)
-	}
-	params.Set("pageNo", strconv.Itoa(pageNo))
-	params.Set("pageSize", strconv.Itoa(pageSize))
-	body, status, err := c.get(ctx, "/v1/cs/history", params)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("listing config history failed with HTTP %d", status)}
-	}
-	var page configHistoryPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		return nil, &apiError{Message: fmt.Sprintf("unexpected history response: %v", err)}
-	}
-	if page.PageItems == nil {
-		page.PageItems = []configRevision{}
-	}
-	return &page, nil
-}
-
-// getConfigRevision 读取单个历史版本的完整内容（按历史记录 id）。
-func (c *nacosClient) getConfigRevision(ctx context.Context, namespace, dataID, group, historyID string) (*configRevisionDetail, error) {
-	if strings.TrimSpace(historyID) == "" {
-		return nil, &apiError{Message: "historyId is required"}
-	}
-	params := url.Values{}
-	params.Set("search", "accurate")
-	params.Set("dataId", dataID)
-	params.Set("group", group)
-	if namespace != "" {
-		params.Set("tenant", namespace)
-	}
-	params.Set("nid", historyID)
-	body, status, err := c.get(ctx, "/v1/cs/history", params)
-	if err != nil {
-		return nil, err
-	}
-	switch status {
-	case http.StatusOK:
-		var detail configRevisionDetail
-		if err := json.Unmarshal(body, &detail); err != nil {
-			return nil, &apiError{Message: fmt.Sprintf("unexpected history detail response: %v", err)}
-		}
-		return &detail, nil
-	case http.StatusNotFound:
-		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("config revision not found: dataId=%s group=%s namespace=%q historyId=%s", dataID, group, namespace, historyID)}
-	default:
-		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("reading config revision failed with HTTP %d", status)}
-	}
-}
-
 // namespace is one Nacos namespace entry.
 type namespace struct {
 	NamespaceID   string `json:"namespace"`
@@ -521,29 +619,6 @@ type namespace struct {
 	ConfigCount   int    `json:"configCount"`
 	Quota         int    `json:"quota"`
 	NamespaceType int    `json:"type"`
-}
-
-// listNamespaces returns every namespace defined on the server.
-func (c *nacosClient) listNamespaces(ctx context.Context) ([]namespace, error) {
-	body, status, err := c.get(ctx, "/v1/console/namespaces", url.Values{})
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("listing namespaces failed with HTTP %d", status)}
-	}
-	var payload struct {
-		Code int         `json:"code"`
-		Data []namespace `json:"data"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, &apiError{Message: fmt.Sprintf("unexpected namespace response: %v", err)}
-	}
-	if payload.Data == nil {
-		payload.Data = []namespace{}
-	}
-	return payload.Data, nil
 }
 
 // servicePage is the paginated result of a service list call.
@@ -561,40 +636,15 @@ func (p *servicePage) services() []string {
 	return out
 }
 
-// listServices lists registered service names in a namespace.
-func (c *nacosClient) listServices(ctx context.Context, namespace, groupName string, pageNo, pageSize int) (*servicePage, error) {
-	pageNo, pageSize = normalizePaging(pageNo, pageSize)
-	params := url.Values{}
-	params.Set("pageNo", strconv.Itoa(pageNo))
-	params.Set("pageSize", strconv.Itoa(pageSize))
-	if namespace != "" {
-		params.Set("namespaceId", namespace)
-	}
-	if groupName != "" {
-		params.Set("groupName", groupName)
-	}
-	body, status, err := c.get(ctx, "/v1/ns/service/list", params)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("listing services failed with HTTP %d", status)}
-	}
-	var page servicePage
-	if err := json.Unmarshal(body, &page); err != nil {
-		return nil, &apiError{Message: fmt.Sprintf("unexpected service response: %v", err)}
-	}
-	return &page, nil
-}
-
-// instanceHost 是服务实例的关键字段（对齐 Nacos /v1/ns/instance/list 响应）。
+// instanceHost 是服务实例的关键字段。
+// Valid 只在 v1 响应中出现（v3 的 Instance 对象没有该字段），因此用指针
+// 区分“服务端给了 false”与“服务端没这个字段”。
 type instanceHost struct {
 	IP          string         `json:"ip"`
 	Port        int            `json:"port"`
 	Healthy     bool           `json:"healthy"`
 	Enabled     bool           `json:"enabled"`
-	Valid       bool           `json:"valid"`
+	Valid       *bool          `json:"valid"`
 	Weight      float64        `json:"weight"`
 	ClusterName string         `json:"clusterName"`
 	Metadata    map[string]any `json:"metadata"`
@@ -608,65 +658,154 @@ type instanceList struct {
 	Reachable bool           `json:"reachable"`
 }
 
-// listInstances 查询某个服务在指定命名空间下的实例列表。
-func (c *nacosClient) listInstances(ctx context.Context, namespace, groupName, serviceName string) (*instanceList, error) {
-	if strings.TrimSpace(serviceName) == "" {
-		return nil, &apiError{Message: "serviceName is required"}
+// --- read capability dispatch ----------------------------------------------
+
+// readConfig 读取单条配置。exists 为 false 表示该配置不存在（v1 为 404，
+// v3 client 接口为 code 20004），与网络或权限错误区分开——跨环境对比需要把
+// “缺少配置”当作一种正常状态处理。
+func (c *nacosClient) readConfig(ctx context.Context, namespace, dataID, group string) (content string, exists bool, err error) {
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return "", false, err
 	}
-	params := url.Values{}
-	params.Set("serviceName", serviceName)
-	if namespace != "" {
-		params.Set("namespaceId", namespace)
+	if family == familyV3 {
+		return c.v3ReadConfig(ctx, namespace, dataID, group)
 	}
-	if groupName != "" {
-		params.Set("groupName", groupName)
+	return c.v1ReadConfig(ctx, namespace, dataID, group)
+}
+
+// getConfig returns the full content of one config.
+func (c *nacosClient) getConfig(ctx context.Context, namespace, dataID, group string) (string, error) {
+	content, exists, err := c.readConfig(ctx, namespace, dataID, group)
+	if err != nil {
+		return "", err
 	}
-	body, status, err := c.get(ctx, "/v1/ns/instance/list", params)
+	if !exists {
+		return "", &apiError{Status: http.StatusNotFound,
+			Message: fmt.Sprintf("config not found: dataId=%s group=%s namespace=%q", dataID, group, namespace)}
+	}
+	return content, nil
+}
+
+// searchConfigs lists config metadata. Empty patterns match everything; the
+// blur search treats "*" as a wildcard on both protocol stacks.
+func (c *nacosClient) searchConfigs(ctx context.Context, namespace, dataIDPattern, groupPattern string, pageNo, pageSize int) (*configPage, error) {
+	family, err := c.resolveFamily(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if status != http.StatusOK {
-		return nil, &apiError{Status: status,
-			Message: fmt.Sprintf("listing instances failed with HTTP %d", status)}
+	if family == familyV3 {
+		return c.v3SearchConfigs(ctx, namespace, dataIDPattern, groupPattern, pageNo, pageSize)
 	}
-	var payload instanceList
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, &apiError{Message: fmt.Sprintf("unexpected instance response: %v", err)}
-	}
-	if payload.Hosts == nil {
-		payload.Hosts = []instanceHost{}
-	}
-	return &payload, nil
+	return c.v1SearchConfigs(ctx, namespace, dataIDPattern, groupPattern, pageNo, pageSize)
 }
 
-// --- health -----------------------------------------------------------------
+// listConfigHistory 按 dataId 列出历史版本，最新在前。
+func (c *nacosClient) listConfigHistory(ctx context.Context, namespace, dataID, group string, pageNo, pageSize int) (*configHistoryPage, error) {
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if family == familyV3 {
+		return c.v3ListConfigHistory(ctx, namespace, dataID, group, pageNo, pageSize)
+	}
+	return c.v1ListConfigHistory(ctx, namespace, dataID, group, pageNo, pageSize)
+}
+
+// getConfigRevision 读取单个历史版本的完整内容（按历史记录 id）。
+func (c *nacosClient) getConfigRevision(ctx context.Context, namespace, dataID, group, historyID string) (*configRevisionDetail, error) {
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if family == familyV3 {
+		return c.v3GetConfigRevision(ctx, namespace, dataID, group, historyID)
+	}
+	return c.v1GetConfigRevision(ctx, namespace, dataID, group, historyID)
+}
+
+// listNamespaces returns every namespace defined on the server.
+func (c *nacosClient) listNamespaces(ctx context.Context) ([]namespace, error) {
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if family == familyV3 {
+		return c.v3ListNamespaces(ctx)
+	}
+	return c.v1ListNamespaces(ctx)
+}
+
+// listServices lists registered service names in a namespace.
+func (c *nacosClient) listServices(ctx context.Context, namespace, groupName string, pageNo, pageSize int) (*servicePage, error) {
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if family == familyV3 {
+		return c.v3ListServices(ctx, namespace, groupName, pageNo, pageSize)
+	}
+	return c.v1ListServices(ctx, namespace, groupName, pageNo, pageSize)
+}
+
+// listInstances 查询某个服务在指定命名空间下的实例列表。
+func (c *nacosClient) listInstances(ctx context.Context, namespace, groupName, serviceName, cluster string) (*instanceList, error) {
+	family, err := c.resolveFamily(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if family == familyV3 {
+		return c.v3ListInstances(ctx, namespace, groupName, serviceName, cluster)
+	}
+	return c.v1ListInstances(ctx, namespace, groupName, serviceName, cluster)
+}
 
 // health probes the server and returns a short status description.
-// Nacos 2.x+ exposes /v1/console/health/readiness; 1.x only has server/state.
 func (c *nacosClient) health(ctx context.Context) (string, error) {
-	body, status, err := c.get(ctx, "/v1/console/health/readiness", url.Values{})
+	family, err := c.resolveFamily(ctx)
 	if err != nil {
 		return "", err
 	}
-	if status == http.StatusOK {
-		return fmt.Sprintf("ready: %s", truncate(string(body), 120)), nil
+	if family == familyV3 {
+		return c.v3Health(ctx)
 	}
-	body, state, err := c.get(ctx, "/v1/console/server/state", url.Values{})
-	if err != nil {
-		return "", err
+	status, ok := c.v1HealthStatus(ctx)
+	if !ok {
+		return "", &apiError{Message: "server did not answer health checks"}
 	}
-	if state != http.StatusOK {
-		return "", &apiError{Status: state,
-			Message: fmt.Sprintf("server did not answer health checks (HTTP %d)", state)}
+	return status, nil
+}
+
+// --- helpers ----------------------------------------------------------------
+
+// normalizePaging clamps caller supplied paging values. pageSize is clamped to
+// the Nacos maximum rather than silently reset to the default, so a caller that
+// asks for more than allowed still gets as much as the server will serve.
+func normalizePaging(pageNo, pageSize int) (int, int) {
+	if pageNo <= 0 {
+		pageNo = 1
 	}
-	var payload struct {
-		Version string `json:"version"`
+	switch {
+	case pageSize <= 0:
+		pageSize = 20
+	case pageSize > maxPageSize:
+		pageSize = maxPageSize
 	}
-	_ = json.Unmarshal(body, &payload)
-	if payload.Version != "" {
-		return fmt.Sprintf("up (Nacos %s)", payload.Version), nil
+	return pageNo, pageSize
+}
+
+// blurPattern 把用户输入的关键词转换为 Nacos blur 搜索模式：
+// 空输入匹配全部（*）；不含通配符时按包含匹配（*kw*）；已带 * 的原样保留。
+// v1 与 v3 的 blur 搜索对 * 的语义一致（实测确认）。
+func blurPattern(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "*"
 	}
-	return "up", nil
+	if !strings.Contains(value, "*") {
+		return "*" + value + "*"
+	}
+	return value
 }
 
 // truncate shortens strings embedded into messages. The limit counts runes so
